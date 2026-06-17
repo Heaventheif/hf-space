@@ -1,0 +1,18 @@
+name: Keep Hugging Face Space Alive
+on:
+  schedule:
+    # يعمل تلقائياً كل يوم في تمام الساعة 12:00 ظهراً بتوقيت جرينتش
+    - cron: '0 12 * * *'
+  workflow_dispatch: # يتيح لك تشغيل الأداة يدوياً في أي وقت للتجربة
+
+jobs:
+  wake-up:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Simulate Real User Visit
+        run: |
+          echo "جاري إيقاظ فضاء Hugging Face بأمان..."
+          curl -s -L -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+          https://huggingface.co \
+          -o /dev/null
+          echo "تمت زيارة الفضاء بنجاح والخادم مستيقظ الآن!"
