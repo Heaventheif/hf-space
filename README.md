@@ -1,2 +1,8 @@
-# hf-space
-hf space repo for sunken bot
+---
+title: Scraper Server
+emoji: 🕷️
+colorFrom: blue
+colorTo: green
+sdk: docker
+pinned: false
+---

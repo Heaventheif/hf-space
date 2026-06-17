@@ -1,0 +1,39 @@
+# ════════════════════════════════════════════════════════════
+#  requirements.txt — Sv2 HF Space
+#  يغطي: plugins/ القديمة + الجديدة (gptx, quran, sing,
+#         pinterest, translate, yt, random, fb, cerebras)
+# ════════════════════════════════════════════════════════════
+
+# ─── Web Framework ───────────────────────────────────────────
+fastapi
+uvicorn[standard]
+python-multipart          # مطلوب لـ FastAPI عند رفع الملفات
+
+# ─── HTTP Client ─────────────────────────────────────────────
+httpx                     # gptx / groq / sing / yt / random / fb / quran / translate / cerebras
+requests  # image.py / proxy_client.py
+yt-dlp
+
+# ─── HTML Parsing ────────────────────────────────────────────
+beautifulsoup4            # novel.py / wtr_lab.py / random.py
+lxml                      # محرك parsing أسرع لـ BeautifulSoup
+
+# ─── Browser / Scraping ──────────────────────────────────────
+playwright                # browser.py (fallback)
+curl_cffi                 # browser.py (طبقة 1 — أسرع)
+rebrowser-playwright      # browser.py (طبقة 2 — بدون fingerprint)
+
+# ─── AI / ML ─────────────────────────────────────────────────
+google-genai              # gemini.py  ← from google import genai
+huggingface_hub           # hf.py      ← InferenceClient
+
+# ─── Chess Engine ────────────────────────────────────────────
+chess                     # chess.py / chess_engine.py
+cairosvg                  # chess_engine.py ← تحويل SVG → PNG
+
+# ─── Database (Async MongoDB) ────────────────────────────────
+motor                     # gptx.py / cerebras.py ← AsyncIOMotorClient
+
+# ─── Utils ───────────────────────────────────────────────────
+python-dotenv             # تحميل .env
+pydantic                  # chess_engine.py ← BaseModel / MoveRequest
