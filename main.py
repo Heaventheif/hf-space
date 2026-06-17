@@ -10,7 +10,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from plugin_loader import load_all_plugins
-from keepalive import keep_alive
 
 # ─── تفعيل logging ليظهر في لوق HF ──────────────────
 logging.basicConfig(
@@ -40,8 +39,3 @@ async def health():
 
 # ─── تحميل كل الـ plugins عند البداية ───────────────
 load_all_plugins(app)
-
-# ─── تشغيل keepalive عند البداية ─────────────────────
-@app.on_event("startup")
-async def startup():
-    asyncio.create_task(keep_alive())
