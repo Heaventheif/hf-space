@@ -1,8 +1,7 @@
-# scrapers/wtr_lab.py  v6 — Playwright JS rendering + fallback HTML parsing
+# scrapers/wtr_lab.py  v6 — curl only (webplus/web tabs)
 
 import re
 import json
-import asyncio
 import logging
 from difflib import SequenceMatcher
 from bs4 import BeautifulSoup
@@ -23,12 +22,6 @@ _PAYWALL_WORDS = [
     "ad blocker detected", "disable adblock", "please disable",
     "subscribe to read", "unlock chapter", "premium chapter",
     "disable your ad", "ad-blocker", "adblock",
-    "تتطلب الترجمة بالذكاء", "يمكن للضيوف معاينة",
-    "تم اكتشاف مانع", "مانع الإعلانات", "أداة حظر الإعلانات",
-    "يرجى تعطيل", "قم بالتسجيل", "ترجمة الويب من google",
-    "لمواصلة الاستمتاع بالمحتوى", "إعلان به مشكلة",
-    "يمكنك تعطيل الإعلانات", "دعم موقعنا", "لدعم موقعنا",
-    "الاستمتاع بالمحتوى المجاني", "لمواصلة استخدام الترجمة",
     "or click here to read with google",
     "sign up for free to continue",
     "ai translation requires registration",
@@ -71,69 +64,12 @@ def _is_ai_paywall_block(html: str) -> bool:
     return any(marker in head for marker in _AI_PAYWALL_MARKERS)
 
 
-class _AiPaywallError(Exception):
-    pass
-
-
 async def _fetch_curl(url: str, timeout: int = 20) -> str:
     from curl_cffi.requests import AsyncSession
     async with AsyncSession(impersonate="chrome124") as session:
         r = await session.get(url, timeout=timeout)
         r.raise_for_status()
         return r.text
-
-
-async def _fetch_playwright(url: str, timeout: int = 30) -> str:
-    """
-    جلب الصفحة بعد تنفيذ JavaScript الكامل عبر Playwright.
-    يضغط على تبويب Web+ إذا وُجد، ثم ينتظر ظهور محتوى الفصل.
-    """
-    try:
-        from playwright.async_api import async_playwright
-    except ImportError:
-        raise RuntimeError("playwright غير مثبّت — أضف 'playwright' إلى requirements.txt")
-
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
-        )
-        ctx = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1280, "height": 800},
-        )
-        page = await ctx.new_page()
-
-        try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
-
-            # محاولة الضغط على تبويب "Web+" إذا لم يكن محدداً بعد
-            try:
-                webplus_tab = page.locator("button:has-text('Web+'), [data-tab='webplus'], .tab-webplus")
-                if await webplus_tab.count() > 0:
-                    await webplus_tab.first.click()
-                    await page.wait_for_timeout(2000)
-            except Exception:
-                pass
-
-            # انتظار ظهور محتوى الفصل
-            try:
-                await page.wait_for_selector(
-                    ".chapter-content, .webplus-content, .serie-content, #chapter-content",
-                    timeout=10000,
-                )
-            except Exception:
-                pass  # نكمل حتى لو لم يُوجد
-
-            html = await page.content()
-        finally:
-            await browser.close()
-
-    return html
 
 
 def _extract_paragraphs(soup: BeautifulSoup):
@@ -194,7 +130,6 @@ def _extract_paragraphs(soup: BeautifulSoup):
 
 
 def _extract_next_data(html: str) -> dict | None:
-    """استخراج من __NEXT_DATA__ JSON"""
     m = re.search(r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>', html, re.DOTALL)
     if not m:
         return None
@@ -220,7 +155,7 @@ def _extract_next_data(html: str) -> dict | None:
         return None
 
     content_raw   = find_key(data, "content", "chapterContent", "body", "text", "webplus", "paragraphs")
-    chapter_title = find_key(data, "chapterTitle", "chapter_title", "chapterName", "title")
+    chapter_title = find_key(data, "chapterTitle", "chapter_title", "chapterName")
     novel_title   = find_key(data, "novelTitle", "novel_title", "novelName", "serieName")
 
     if not content_raw:
@@ -251,6 +186,30 @@ def _extract_next_data(html: str) -> dict | None:
     }
 
 
+def _parse_html(html: str, chapter_num: int, url: str) -> dict | None:
+    next_data = _extract_next_data(html)
+    if next_data and len(next_data["paragraphs"]) >= 3:
+        return {
+            "title":           next_data["novel_title"]   or "Novel",
+            "chapter_title":   next_data["chapter_title"] or f"Chapter {chapter_num}",
+            "paragraphs":      next_data["paragraphs"],
+            "url":             url,
+            "paragraph_count": len(next_data["paragraphs"]),
+        }
+
+    soup = BeautifulSoup(html, "lxml")
+    paragraphs, chapter_title, novel_title = _extract_paragraphs(soup)
+    if len(paragraphs) >= 3:
+        return {
+            "title":           novel_title   or "Novel",
+            "chapter_title":   chapter_title or f"Chapter {chapter_num}",
+            "paragraphs":      paragraphs,
+            "url":             url,
+            "paragraph_count": len(paragraphs),
+        }
+    return None
+
+
 async def search_novel(novel_name: str) -> dict:
     from urllib.parse import quote
     search_url = f"https://wtr-lab.com/en/novel-finder?text={quote(novel_name)}"
@@ -263,7 +222,6 @@ async def search_novel(novel_name: str) -> dict:
         raise ValueError(f"فشل جلب نتائج البحث: {e}")
 
     soup = BeautifulSoup(html, "lxml")
-
     results = []
     seen = set()
     for a in soup.select('a[href*="/novel/"]'):
@@ -295,27 +253,16 @@ async def search_novel(novel_name: str) -> dict:
 
 
 async def scrape_chapter(novel_id: str, novel_slug: str, chapter_num: int) -> dict:
-    """
-    استراتيجية الجلب:
-    1. curl_cffi مع ?service=webplus  → سريع، لا يحتاج JS
-    2. curl_cffi مع ?service=web      → سريع، لا يحتاج JS
-    3. Playwright مع ?service=webplus  → بطيء، ينفذ JS كاملاً
-    4. Playwright مع ?service=web      → بطيء، ينفذ JS كاملاً
-    """
-    base_url = f"https://wtr-lab.com/en/novel/{novel_id}/{novel_slug}/chapter-{chapter_num}"
-
-    # المرحلة 1: محاولات curl_cffi السريعة
-    curl_urls = [
-        f"{base_url}?service=webplus",
-        f"{base_url}?service=web",
+    base = f"https://wtr-lab.com/en/novel/{novel_id}/{novel_slug}/chapter-{chapter_num}"
+    urls = [
+        f"{base}?service=webplus",
+        f"{base}?service=web",
     ]
-    for url in curl_urls:
+    for url in urls:
         try:
             html = await _fetch_curl(url, timeout=20)
-            if _is_cloudflare(html):
-                continue
-            if _is_ai_paywall_block(html):
-                logger.warning(f"[WTR/curl] 🔒 {url}: AI paywall — تخطي")
+            if _is_cloudflare(html) or _is_ai_paywall_block(html):
+                logger.warning(f"[WTR/curl] 🔒 {url}: paywall/cloudflare")
                 continue
             result = _parse_html(html, chapter_num, url)
             if result:
@@ -324,61 +271,4 @@ async def scrape_chapter(novel_id: str, novel_slug: str, chapter_num: int) -> di
         except Exception as e:
             logger.warning(f"[WTR/curl] ❌ {url}: {e}")
 
-    # المرحلة 2: Playwright (ينفذ JS)
-    playwright_urls = [
-        f"{base_url}?service=webplus",
-        f"{base_url}?service=web",
-    ]
-    for url in playwright_urls:
-        try:
-            logger.info(f"[WTR/playwright] 🌐 جاري تحميل {url} ...")
-            html = await _fetch_playwright(url, timeout=30)
-            if _is_cloudflare(html):
-                continue
-            if _is_ai_paywall_block(html):
-                logger.warning(f"[WTR/playwright] 🔒 {url}: AI paywall حتى بعد JS")
-                continue
-            result = _parse_html(html, chapter_num, url)
-            if result:
-                logger.info(f"[WTR/playwright] ✅ {url} — {result['paragraph_count']} فقرة")
-                return result
-        except RuntimeError as e:
-            # playwright غير مثبت
-            logger.warning(f"[WTR/playwright] ⚠️ {e}")
-            break
-        except Exception as e:
-            logger.warning(f"[WTR/playwright] ❌ {url}: {e}")
-
-    raise ValueError(
-        f"فشل كشط الفصل {chapter_num} من wtr-lab: "
-        "كل المحاولات (curl + Playwright) فشلت. "
-        "قد يتطلب الموقع تسجيل دخول أو يحظر الأتمتة."
-    )
-
-
-def _parse_html(html: str, chapter_num: int, url: str) -> dict | None:
-    """يحاول استخراج فقرات الفصل من HTML (بعد أو قبل JS rendering)."""
-    # محاولة 1: __NEXT_DATA__
-    next_data = _extract_next_data(html)
-    if next_data and len(next_data["paragraphs"]) >= 3:
-        return {
-            "title":           next_data["novel_title"]   or "رواية",
-            "chapter_title":   next_data["chapter_title"] or f"الفصل {chapter_num}",
-            "paragraphs":      next_data["paragraphs"],
-            "url":             url,
-            "paragraph_count": len(next_data["paragraphs"]),
-        }
-
-    # محاولة 2: HTML parsing
-    soup = BeautifulSoup(html, "lxml")
-    paragraphs, chapter_title, novel_title = _extract_paragraphs(soup)
-    if len(paragraphs) >= 3:
-        return {
-            "title":           novel_title   or "رواية",
-            "chapter_title":   chapter_title or f"الفصل {chapter_num}",
-            "paragraphs":      paragraphs,
-            "url":             url,
-            "paragraph_count": len(paragraphs),
-        }
-
-    return None
+    raise ValueError(f"wtr-lab: فشل كشط الفصل {chapter_num} — الموقع يحجب الطلبات")
