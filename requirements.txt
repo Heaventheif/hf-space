@@ -28,3 +28,4 @@ pydantic
 
 # Scraping
 curl_cffi
+playwright
