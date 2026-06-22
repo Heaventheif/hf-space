@@ -1,12 +1,12 @@
 """
-plugins/novel.py — v2
+plugins/novel.py — v3
 روايات: wtr-lab + novelbin + lightnovelworld كـ fallback
 """
 import time
 import asyncio
 import traceback
 import logging
-import httpx
+from urllib.parse import quote
 from difflib import SequenceMatcher
 from bs4 import BeautifulSoup
 from fastapi import Query
@@ -19,25 +19,33 @@ DESCRIPTION     = "روايات: wtr-lab + novelbin + lightnovelworld"
 DOCKERFILE_DEPS = []
 
 
+async def _fetch_curl(url: str, timeout: int = 20) -> str:
+    """جلب الصفحة عبر curl_cffi مع تقليد متصفح حقيقي — يتجاوز حظر WAF/Cloudflare
+    الذي كان يرفض طلبات httpx العادية بـ 403."""
+    from curl_cffi.requests import AsyncSession
+    async with AsyncSession(impersonate="chrome124") as session:
+        r = await session.get(url, timeout=timeout)
+        r.raise_for_status()
+        return r.text
+
+
 # ═══════════════════════════════════════════════════
 # Novelbin Scraper (fallback 1)
 # ═══════════════════════════════════════════════════
 
 async def _novelbin_search(query: str) -> dict | None:
     try:
-        async with httpx.AsyncClient(timeout=15, follow_redirects=True,
-            headers={"User-Agent": "Mozilla/5.0"}) as c:
-            r = await c.get(f"https://novelbin.com/search?keyword={query}")
-            soup = BeautifulSoup(r.text, "lxml")
-            item = soup.select_one(".list-novel .row-item, .novel-item")
-            if not item:
-                return None
-            a = item.select_one("a[href*='/novel/']")
-            if not a:
-                return None
-            title = a.get_text(strip=True)
-            slug  = a["href"].split("/novel/")[-1].rstrip("/")
-            return {"title": title, "slug": slug, "source": "novelbin"}
+        html = await _fetch_curl(f"https://novelbin.com/search?keyword={quote(query)}", timeout=15)
+        soup = BeautifulSoup(html, "lxml")
+        item = soup.select_one(".list-novel .row-item, .novel-item")
+        if not item:
+            return None
+        a = item.select_one("a[href*='/novel/']")
+        if not a:
+            return None
+        title = a.get_text(strip=True)
+        slug  = a["href"].split("/novel/")[-1].rstrip("/")
+        return {"title": title, "slug": slug, "source": "novelbin"}
     except Exception as e:
         logger.warning(f"[novelbin/search] {e}")
         return None
@@ -45,28 +53,26 @@ async def _novelbin_search(query: str) -> dict | None:
 
 async def _novelbin_chapter(slug: str, chapter: int) -> dict | None:
     try:
-        url = f"https://novelbin.com/b/{slug}/chapter-{chapter}"
-        async with httpx.AsyncClient(timeout=20, follow_redirects=True,
-            headers={"User-Agent": "Mozilla/5.0"}) as c:
-            r = await c.get(url)
-            soup = BeautifulSoup(r.text, "lxml")
-            # إزالة العناصر غير المرغوبة
-            for el in soup.select("script,style,ins,.ads,#ads,.chapter-nav,.navigation"):
-                el.decompose()
-            content = soup.select_one("#chr-content, #chapter-content, .chr-content, .chapter__content")
-            if not content:
-                return None
-            paras = [p.get_text(" ", strip=True) for p in content.find_all("p") if len(p.get_text(strip=True)) > 20]
-            if len(paras) < 3:
-                return None
-            title_el = soup.select_one(".chr-title, .chapter-title, h2, h1")
-            return {
-                "title": "رواية",
-                "chapter_title": title_el.get_text(strip=True) if title_el else f"الفصل {chapter}",
-                "paragraphs": paras,
-                "url": url,
-                "paragraph_count": len(paras),
-            }
+        url  = f"https://novelbin.com/b/{slug}/chapter-{chapter}"
+        html = await _fetch_curl(url, timeout=20)
+        soup = BeautifulSoup(html, "lxml")
+        # إزالة العناصر غير المرغوبة
+        for el in soup.select("script,style,ins,.ads,#ads,.chapter-nav,.navigation"):
+            el.decompose()
+        content = soup.select_one("#chr-content, #chapter-content, .chr-content, .chapter__content")
+        if not content:
+            return None
+        paras = [p.get_text(" ", strip=True) for p in content.find_all("p") if len(p.get_text(strip=True)) > 20]
+        if len(paras) < 3:
+            return None
+        title_el = soup.select_one(".chr-title, .chapter-title, h2, h1")
+        return {
+            "title": "رواية",
+            "chapter_title": title_el.get_text(strip=True) if title_el else f"الفصل {chapter}",
+            "paragraphs": paras,
+            "url": url,
+            "paragraph_count": len(paras),
+        }
     except Exception as e:
         logger.warning(f"[novelbin/chapter] {e}")
         return None
@@ -78,15 +84,13 @@ async def _novelbin_chapter(slug: str, chapter: int) -> dict | None:
 
 async def _lnw_search(query: str) -> dict | None:
     try:
-        async with httpx.AsyncClient(timeout=15, follow_redirects=True,
-            headers={"User-Agent": "Mozilla/5.0"}) as c:
-            r = await c.get(f"https://www.lightnovelworld.co/search?title={query}")
-            soup = BeautifulSoup(r.text, "lxml")
-            item = soup.select_one(".novel-item a[href*='/novel/']")
-            if not item:
-                return None
-            slug = item["href"].split("/novel/")[-1].rstrip("/")
-            return {"title": item.get_text(strip=True), "slug": slug, "source": "lnw"}
+        html = await _fetch_curl(f"https://www.lightnovelworld.co/search?title={quote(query)}", timeout=15)
+        soup = BeautifulSoup(html, "lxml")
+        item = soup.select_one(".novel-item a[href*='/novel/']")
+        if not item:
+            return None
+        slug = item["href"].split("/novel/")[-1].rstrip("/")
+        return {"title": item.get_text(strip=True), "slug": slug, "source": "lnw"}
     except Exception as e:
         logger.warning(f"[lnw/search] {e}")
         return None
@@ -94,27 +98,25 @@ async def _lnw_search(query: str) -> dict | None:
 
 async def _lnw_chapter(slug: str, chapter: int) -> dict | None:
     try:
-        url = f"https://www.lightnovelworld.co/novel/{slug}/chapter-{chapter}"
-        async with httpx.AsyncClient(timeout=20, follow_redirects=True,
-            headers={"User-Agent": "Mozilla/5.0"}) as c:
-            r = await c.get(url)
-            soup = BeautifulSoup(r.text, "lxml")
-            for el in soup.select("script,style,ins,.ads,.chapter-nav"):
-                el.decompose()
-            content = soup.select_one("#chapter-container, .chapter-content, .text-left")
-            if not content:
-                return None
-            paras = [p.get_text(" ", strip=True) for p in content.find_all("p") if len(p.get_text(strip=True)) > 20]
-            if len(paras) < 3:
-                return None
-            title_el = soup.select_one(".chapter-title, h2")
-            return {
-                "title": "رواية",
-                "chapter_title": title_el.get_text(strip=True) if title_el else f"الفصل {chapter}",
-                "paragraphs": paras,
-                "url": url,
-                "paragraph_count": len(paras),
-            }
+        url  = f"https://www.lightnovelworld.co/novel/{slug}/chapter-{chapter}"
+        html = await _fetch_curl(url, timeout=20)
+        soup = BeautifulSoup(html, "lxml")
+        for el in soup.select("script,style,ins,.ads,.chapter-nav"):
+            el.decompose()
+        content = soup.select_one("#chapter-container, .chapter-content, .text-left")
+        if not content:
+            return None
+        paras = [p.get_text(" ", strip=True) for p in content.find_all("p") if len(p.get_text(strip=True)) > 20]
+        if len(paras) < 3:
+            return None
+        title_el = soup.select_one(".chapter-title, h2")
+        return {
+            "title": "رواية",
+            "chapter_title": title_el.get_text(strip=True) if title_el else f"الفصل {chapter}",
+            "paragraphs": paras,
+            "url": url,
+            "paragraph_count": len(paras),
+        }
     except Exception as e:
         logger.warning(f"[lnw/chapter] {e}")
         return None
