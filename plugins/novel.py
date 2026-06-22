@@ -1,13 +1,11 @@
 """
-plugins/novel.py — v4
-روايات: wtr-lab + readnovelfull + novelbin + lightnovelworld كـ fallback
+plugins/novel.py — v5
+روايات: wtr-lab → fanmtl → novelbin → lightnovelworld → lnmtl
 """
 import time
-import asyncio
 import traceback
 import logging
 from urllib.parse import quote
-from difflib import SequenceMatcher
 from bs4 import BeautifulSoup
 from fastapi import Query
 from fastapi.responses import JSONResponse
@@ -15,7 +13,7 @@ from scrapers.wtr_lab import search_novel, scrape_chapter
 
 logger = logging.getLogger(__name__)
 
-DESCRIPTION     = "روايات: wtr-lab (Playwright) + readnovelfull + novelbin + lightnovelworld"
+DESCRIPTION     = "روايات: wtr-lab + fanmtl + novelbin + lnw + lnmtl"
 DOCKERFILE_DEPS = []
 
 
@@ -28,66 +26,107 @@ async def _fetch_curl(url: str, timeout: int = 20) -> str:
 
 
 # ═══════════════════════════════════════════════════
-# ReadNovelFull Scraper (fallback 1) — أكثر موثوقية
+# FanMTL — HTML مباشر بدون JS ✅
+# رابط الفصل: /novel/<slug>_<N>.html
 # ═══════════════════════════════════════════════════
 
-async def _rnf_search(query: str) -> dict | None:
-    """البحث في readnovelfull.com"""
+async def _fanmtl_search(query: str) -> dict | None:
     try:
-        url  = f"https://readnovelfull.com/novel-list/search?keyword={quote(query)}"
+        url  = f"https://www.fanmtl.com/search.html?keyword={quote(query)}"
         html = await _fetch_curl(url, timeout=15)
         soup = BeautifulSoup(html, "lxml")
-        # نتيجة البحث الأولى
-        item = soup.select_one(".col-novel-main .list-novel .novel-item, .list-novel li")
-        if not item:
-            return None
-        a = item.select_one("a[href]")
-        if not a:
-            return None
-        href  = a["href"]
-        # /novel-name.html  أو  /novel-name
-        slug  = href.rstrip("/").rstrip(".html").split("/")[-1]
-        title = a.get("title") or a.get_text(strip=True)
-        return {"title": title, "slug": slug, "source": "readnovelfull"}
+        for a in soup.select('a[href*="/novel/"]'):
+            href = a.get("href", "")
+            if "_" in href.split("/novel/")[-1]:  # روابط فصول — تجنب
+                continue
+            slug = href.rstrip("/").replace(".html", "").split("/novel/")[-1]
+            if not slug or slug == "novel":
+                continue
+            title = a.get("title") or a.get_text(strip=True).split("\n")[0]
+            if title and len(title) > 2:
+                return {"title": title, "slug": slug}
+        return None
     except Exception as e:
-        logger.warning(f"[rnf/search] {e}")
+        logger.warning(f"[fanmtl/search] {e}")
         return None
 
 
-async def _rnf_chapter(slug: str, chapter: int) -> dict | None:
-    """جلب الفصل من readnovelfull.com"""
+async def _fanmtl_chapter(slug: str, chapter: int) -> dict | None:
     try:
-        # الرابط: /slug/chapter-N.html
-        url  = f"https://readnovelfull.com/{slug}/chapter-{chapter}.html"
+        url  = f"https://www.fanmtl.com/novel/{slug}_{chapter}.html"
         html = await _fetch_curl(url, timeout=20)
+        if "404" in html[:500]:
+            return None
         soup = BeautifulSoup(html, "lxml")
-        for el in soup.select("script,style,ins,.ads,#ads,.chapter-nav"):
+        for el in soup.select("script,style,ins,.ads,nav,header,footer,.chapter-nav,.navigation"):
             el.decompose()
-        content = soup.select_one("#chr-content, #chapter-content, .chr-content")
+        content = soup.select_one(
+            "#chapter-content, .chapter-content, .read-content, "
+            ".content, article, .novel-content, main"
+        )
+        if not content:
+            best, best_len = None, 0
+            for div in soup.find_all("div"):
+                t = div.get_text(strip=True)
+                if len(t) > best_len and not div.find(["nav", "header", "footer"]):
+                    best, best_len = div, len(t)
+            if best_len > 300:
+                content = best
+
         if not content:
             return None
-        paras = [
-            p.get_text(" ", strip=True)
-            for p in content.find_all("p")
-            if len(p.get_text(strip=True)) > 20
-        ]
+
+        paras = [p.get_text(" ", strip=True) for p in content.find_all("p") if len(p.get_text(strip=True)) > 20]
+        if len(paras) < 3:
+            paras = [l.strip() for l in content.get_text("\n").split("\n") if len(l.strip()) > 20]
         if len(paras) < 3:
             return None
-        title_el = soup.select_one(".chr-title, .chapter-title, h2, h1")
+
+        title_el = soup.select_one("h1, h2, .chapter-title")
         return {
-            "title": "رواية",
-            "chapter_title": title_el.get_text(strip=True) if title_el else f"الفصل {chapter}",
-            "paragraphs": paras,
-            "url": url,
+            "title":           "Novel",
+            "chapter_title":   title_el.get_text(strip=True) if title_el else f"Chapter {chapter}",
+            "paragraphs":      paras,
+            "url":             url,
             "paragraph_count": len(paras),
         }
     except Exception as e:
-        logger.warning(f"[rnf/chapter] {e}")
+        logger.warning(f"[fanmtl/chapter] {e}")
         return None
 
 
 # ═══════════════════════════════════════════════════
-# Novelbin Scraper (fallback 2)
+# LNMTL
+# ═══════════════════════════════════════════════════
+
+async def _lnmtl_chapter(slug: str, chapter: int) -> dict | None:
+    try:
+        url  = f"https://lnmtl.com/chapter/{slug}/chapter-{chapter}"
+        html = await _fetch_curl(url, timeout=20)
+        soup = BeautifulSoup(html, "lxml")
+        for el in soup.select("script,style,ins,.ads,.navigation"):
+            el.decompose()
+        content = soup.select_one(".chapter-body, .translated, #chapter-content")
+        if not content:
+            return None
+        paras = [p.get_text(" ", strip=True) for p in content.find_all("p") if len(p.get_text(strip=True)) > 20]
+        if len(paras) < 3:
+            return None
+        title_el = soup.select_one("h1, .chapter-title")
+        return {
+            "title":           "Novel",
+            "chapter_title":   title_el.get_text(strip=True) if title_el else f"Chapter {chapter}",
+            "paragraphs":      paras,
+            "url":             url,
+            "paragraph_count": len(paras),
+        }
+    except Exception as e:
+        logger.warning(f"[lnmtl/chapter] {e}")
+        return None
+
+
+# ═══════════════════════════════════════════════════
+# Novelbin
 # ═══════════════════════════════════════════════════
 
 async def _novelbin_search(query: str) -> dict | None:
@@ -101,7 +140,7 @@ async def _novelbin_search(query: str) -> dict | None:
         if not a:
             return None
         slug = a["href"].split("/novel/")[-1].rstrip("/")
-        return {"title": a.get_text(strip=True), "slug": slug, "source": "novelbin"}
+        return {"title": a.get_text(strip=True), "slug": slug}
     except Exception as e:
         logger.warning(f"[novelbin/search] {e}")
         return None
@@ -122,10 +161,10 @@ async def _novelbin_chapter(slug: str, chapter: int) -> dict | None:
             return None
         title_el = soup.select_one(".chr-title, .chapter-title, h2, h1")
         return {
-            "title": "رواية",
-            "chapter_title": title_el.get_text(strip=True) if title_el else f"الفصل {chapter}",
-            "paragraphs": paras,
-            "url": url,
+            "title":           "Novel",
+            "chapter_title":   title_el.get_text(strip=True) if title_el else f"Chapter {chapter}",
+            "paragraphs":      paras,
+            "url":             url,
             "paragraph_count": len(paras),
         }
     except Exception as e:
@@ -134,7 +173,7 @@ async def _novelbin_chapter(slug: str, chapter: int) -> dict | None:
 
 
 # ═══════════════════════════════════════════════════
-# LightNovelWorld Scraper (fallback 3)
+# LightNovelWorld
 # ═══════════════════════════════════════════════════
 
 async def _lnw_search(query: str) -> dict | None:
@@ -145,7 +184,7 @@ async def _lnw_search(query: str) -> dict | None:
         if not item:
             return None
         slug = item["href"].split("/novel/")[-1].rstrip("/")
-        return {"title": item.get_text(strip=True), "slug": slug, "source": "lnw"}
+        return {"title": item.get_text(strip=True), "slug": slug}
     except Exception as e:
         logger.warning(f"[lnw/search] {e}")
         return None
@@ -166,10 +205,10 @@ async def _lnw_chapter(slug: str, chapter: int) -> dict | None:
             return None
         title_el = soup.select_one(".chapter-title, h2")
         return {
-            "title": "رواية",
-            "chapter_title": title_el.get_text(strip=True) if title_el else f"الفصل {chapter}",
-            "paragraphs": paras,
-            "url": url,
+            "title":           "Novel",
+            "chapter_title":   title_el.get_text(strip=True) if title_el else f"Chapter {chapter}",
+            "paragraphs":      paras,
+            "url":             url,
             "paragraph_count": len(paras),
         }
     except Exception as e:
@@ -178,13 +217,32 @@ async def _lnw_chapter(slug: str, chapter: int) -> dict | None:
 
 
 # ═══════════════════════════════════════════════════
-# الجلب الموحد مع fallbacks
+# دالة مساعدة: جلب slug lnmtl من اسم الرواية
+# ═══════════════════════════════════════════════════
+
+async def _lnmtl_search(query: str) -> dict | None:
+    try:
+        url  = f"https://lnmtl.com/novel?filter%5Bq%5D={quote(query)}"
+        html = await _fetch_curl(url, timeout=15)
+        soup = BeautifulSoup(html, "lxml")
+        a = soup.select_one('.novel-item a[href*="/novel/"], .thumbnail a[href*="/novel/"]')
+        if not a:
+            return None
+        slug = a["href"].rstrip("/").split("/novel/")[-1]
+        return {"title": a.get_text(strip=True), "slug": slug}
+    except Exception as e:
+        logger.warning(f"[lnmtl/search] {e}")
+        return None
+
+
+# ═══════════════════════════════════════════════════
+# الجلب الموحد: wtr-lab → fanmtl → novelbin → lnw → lnmtl
 # ═══════════════════════════════════════════════════
 
 async def fetch_with_fallback(name: str, chapter: int) -> dict:
     errors = []
 
-    # 1. wtr-lab (curl أولاً، ثم Playwright إن فشل)
+    # 1. wtr-lab
     try:
         info = await search_novel(name)
         ch   = await scrape_chapter(info["id"], info["slug"], chapter)
@@ -197,20 +255,20 @@ async def fetch_with_fallback(name: str, chapter: int) -> dict:
         errors.append(f"wtr-lab: {e}")
         logger.warning(f"[novel/fallback] wtr-lab فشل: {e}")
 
-    # 2. readnovelfull
+    # 2. fanmtl — HTML مباشر، موثوق
     try:
-        rnf = await _rnf_search(name)
-        if rnf:
-            ch = await _rnf_chapter(rnf["slug"], chapter)
+        fm = await _fanmtl_search(name)
+        if fm:
+            ch = await _fanmtl_chapter(fm["slug"], chapter)
             if ch:
                 return {
-                    "source": "readnovelfull",
-                    "novel":  {"title": rnf["title"], "url": f"https://readnovelfull.com/{rnf['slug']}.html"},
+                    "source": "fanmtl",
+                    "novel":  {"title": fm["title"], "url": f"https://www.fanmtl.com/novel/{fm['slug']}.html"},
                     "chapter": ch,
                 }
-        errors.append("readnovelfull: لم يُجد نتائج أو فصلاً")
+        errors.append("fanmtl: لم يُجد نتائج أو فصلاً")
     except Exception as e:
-        errors.append(f"readnovelfull: {e}")
+        errors.append(f"fanmtl: {e}")
 
     # 3. novelbin
     try:
@@ -242,11 +300,26 @@ async def fetch_with_fallback(name: str, chapter: int) -> dict:
     except Exception as e:
         errors.append(f"lightnovelworld: {e}")
 
+    # 5. lnmtl
+    try:
+        lm = await _lnmtl_search(name)
+        if lm:
+            ch = await _lnmtl_chapter(lm["slug"], chapter)
+            if ch:
+                return {
+                    "source": "lnmtl",
+                    "novel":  {"title": lm["title"], "url": f"https://lnmtl.com/novel/{lm['slug']}"},
+                    "chapter": ch,
+                }
+        errors.append("lnmtl: لم يُجد نتائج أو فصلاً")
+    except Exception as e:
+        errors.append(f"lnmtl: {e}")
+
     raise ValueError("كل المصادر فشلت:\n" + "\n".join(errors))
 
 
 # ═══════════════════════════════════════════════════
-# Register Routes
+# Routes
 # ═══════════════════════════════════════════════════
 
 def register(app):
@@ -282,7 +355,7 @@ def register(app):
                 "novel":           result["novel"],
                 "chapter": {
                     "number":          chapter,
-                    "title":           ch.get("chapter_title", f"الفصل {chapter}"),
+                    "title":           ch.get("chapter_title", f"Chapter {chapter}"),
                     "paragraphs":      ch["paragraphs"],
                     "paragraph_count": ch["paragraph_count"],
                     "url":             ch.get("url", ""),
