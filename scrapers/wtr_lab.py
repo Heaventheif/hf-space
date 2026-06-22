@@ -60,6 +60,32 @@ def _is_cloudflare(html: str) -> bool:
     return "just a moment" in head or "cloudflare" in head or "cf-browser-verification" in head
 
 
+_AI_PAYWALL_MARKERS = [
+    "ai translation requires registration",
+    "ai translation requires",
+    "guests can preview ai translation",
+    "sign up for free to continue",
+    "or click here to read with google",
+    "تتطلب الترجمة بالذكاء الاصطناعي",
+    "يمكن للضيوف معاينة",
+]
+
+
+def _is_ai_paywall_block(html: str) -> bool:
+    """يكتشف تحديداً حالة كون المحتوى المُستخرج هو كتلة "AI Translation Requires
+    Registration" (تبويب AI الافتراضي المحظور للزوار) بدل محتوى الفصل الحقيقي.
+    هذا يختلف عن Cloudflare/404: الصفحة تُحمَّل بنجاح لكنها تعرض تبويب AI
+    بدل Web+ المطلوب، رغم تمرير service=webplus في الرابط."""
+    head = html.lower()
+    return any(marker in head for marker in _AI_PAYWALL_MARKERS)
+
+
+class _AiPaywallError(Exception):
+    """يُرفع عندما تكون الصفحة المُجلَبة هي كتلة AI المحظورة بدل المحتوى الحقيقي،
+    لتمييزها عن أخطاء الشبكة/404/Cloudflare العادية في scrape_chapter."""
+    pass
+
+
 async def _fetch_curl(url: str, timeout: int = 20) -> str:
     from curl_cffi.requests import AsyncSession
     async with AsyncSession(impersonate="chrome124") as session:
@@ -233,29 +259,53 @@ async def search_novel(novel_name: str) -> dict:
 
 
 async def scrape_chapter(novel_id: str, novel_slug: str, chapter_num: int) -> dict:
-    # webplus أولاً في كل رابط — نمط /novel/ هو الأكثر موثوقية ويُجرَّب أولاً.
-    # أنماط /serie-en/ قديمة وتُستخدم فقط لبعض الروايات؛ تُبقى كـ fallback أخير
-    # لأنها قد تنجح مع روايات أخرى حتى لو فشلت هنا (404 على /serie-en لا يعني
-    # أن المشكلة عامة — قد يكون الـ ID/slug غير مدعوم بهذا المخطط لهذه الرواية فقط).
+    # ملاحظة مهمة (مؤكدة من فحص يدوي للموقع):
+    #   /chapter-N                  → تبويب AI (الافتراضي — يطلب تسجيل دخول للزوار)
+    #   /chapter-N?service=webplus  → تبويب Web+  (يعمل بدون تسجيل)
+    #   /chapter-N?service=web      → تبويب Web   (يعمل بدون تسجيل)
+    # لذلك الرابط بدون أي service= هو فعلياً تبويب AI المحظور، وليس fallback آمناً.
+    # الترتيب أدناه يُجرّب webplus ثم web أولاً (كلاهما يعملان فعلياً)، ولا يلجأ
+    # للرابط العادي (AI) أو لمخطط serie-en القديم إلا كملاذ أخير عند فشل الاثنين
+    # الأوليين لسبب آخر (شبكة/404/Cloudflare) — وليس بسبب قفل AI.
     candidate_urls = [
         f"https://wtr-lab.com/en/novel/{novel_id}/{novel_slug}/chapter-{chapter_num}?service=webplus",
-        f"https://wtr-lab.com/en/novel/{novel_id}/{novel_slug}/chapter-{chapter_num}",
+        f"https://wtr-lab.com/en/novel/{novel_id}/{novel_slug}/chapter-{chapter_num}?service=web",
         f"https://wtr-lab.com/en/serie-en/{novel_id}-{novel_slug}/chapter-{chapter_num}?service=webplus",
+        f"https://wtr-lab.com/en/serie-en/{novel_id}-{novel_slug}/chapter-{chapter_num}?service=web",
+        # الروابط بدون service= (AI) تُبقى كآخر ملاذ فقط — أي نجاح هنا يجب أن يُراجع
+        # لاحتمال كونه محتوى AI وليس Web+/Web الحقيقي.
+        f"https://wtr-lab.com/en/novel/{novel_id}/{novel_slug}/chapter-{chapter_num}",
         f"https://wtr-lab.com/en/serie-en/{novel_id}-{novel_slug}/chapter-{chapter_num}",
     ]
     last_error = None
+    ai_block_seen = False
     for url in candidate_urls:
         try:
             result = await _fetch_chapter_page(url, chapter_num)
             if result and result.get("paragraphs"):
                 return result
+        except _AiPaywallError as e:
+            ai_block_seen = True
+            logger.warning(f"[WTR/chapter] 🔒 {url}: تبويب AI محظور — تجربة رابط/تبويب آخر")
+            last_error = e
         except Exception as e:
             logger.warning(f"[WTR/chapter] ❌ {url}: {e}")
             last_error = e
+
+    if ai_block_seen:
+        raise ValueError(
+            f"فشل كشط الفصل {chapter_num}: كل المحاولات أعادت تبويب AI المحظور "
+            f"للزوار (يتطلب تسجيل دخول) — {last_error}"
+        )
     raise ValueError(f"فشل كشط الفصل {chapter_num}: {last_error}")
 
 
 async def _fetch_chapter_page(url: str, chapter_num: int) -> dict:
+    # رابط بدون أي service= هو تبويب AI (مؤكد بالفحص اليدوي) — أي محتوى يُستخرج
+    # منه غير موثوق به كنص رواية حقيقي حتى لو تجاوز فلاتر القفل النصية، لأن AI قد
+    # يعيد ترجمته الخاصة (وليس Web/Web+) أو نصاً جزئياً بسبب حد المعاينة للزوار.
+    is_ai_tab = "service=" not in url
+
     try:
         html = await _fetch_curl(url, timeout=20)
     except Exception as e:
@@ -265,6 +315,17 @@ async def _fetch_chapter_page(url: str, chapter_num: int) -> dict:
         raise ValueError("Cloudflare تحظر الطلب")
     if "404" in html[:2000] or "not found" in html[:2000].lower():
         raise ValueError("404")
+    if _is_ai_paywall_block(html):
+        # الصفحة حُمِّلت بنجاح، لكنها تعرض تبويب AI المحظور للزوار غير المسجلين
+        # (راجع: "AI Translation Requires Registration") بدل تبويب Web/Web+
+        # المطلوب. هذا ليس فشل شبكة أو حظر Cloudflare — لذلك يُرفع استثناء
+        # مخصص يسمح لـ scrape_chapter بتمييزه وتجربة رابط/تبويب آخر مباشرة.
+        raise _AiPaywallError("الصفحة أعادت تبويب AI المحظور (يتطلب تسجيل دخول) بدل المحتوى المطلوب")
+    if is_ai_tab:
+        # احتياط إضافي: حتى لو لم يُكتشف نص القفل صريحاً (مثلاً ضمن أول 10 فصول
+        # المسموح للزوار معاينتها)، الرابط نفسه يستهدف تبويب AI لا Web+/Web —
+        # لذلك لا نعتمد عليه كمصدر أساسي ونرفع نفس الاستثناء لتفضيل بقية الروابط.
+        raise _AiPaywallError("الرابط يستهدف تبويب AI (بدون service=) — يُتجاهل لصالح webplus/web")
 
     # ── محاولة 1: __NEXT_DATA__ JSON (لا يحتاج JS) ─────────────
     next_data = _extract_next_data(html)
