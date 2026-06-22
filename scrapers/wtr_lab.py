@@ -1,8 +1,8 @@
-
-# scrapers/wtr_lab.py  v5 — webplus + __NEXT_DATA__ extraction
+# scrapers/wtr_lab.py  v6 — Playwright JS rendering + fallback HTML parsing
 
 import re
 import json
+import asyncio
 import logging
 from difflib import SequenceMatcher
 from bs4 import BeautifulSoup
@@ -29,7 +29,6 @@ _PAYWALL_WORDS = [
     "لمواصلة الاستمتاع بالمحتوى", "إعلان به مشكلة",
     "يمكنك تعطيل الإعلانات", "دعم موقعنا", "لدعم موقعنا",
     "الاستمتاع بالمحتوى المجاني", "لمواصلة استخدام الترجمة",
-    # Web+ specific
     "or click here to read with google",
     "sign up for free to continue",
     "ai translation requires registration",
@@ -46,12 +45,19 @@ _REMOVE_SELECTORS = [
     ".modal", ".modal-backdrop", ".overlay", "[class*='blur']",
 ]
 
-# Web+ selectors أولاً ثم العامة
 _CONTENT_SELECTORS = [
     ".webplus-content", ".web-plus-content", "[class*='webplus']",
     ".serie-content", ".chapter-content", "#chapter-content",
     "[class*='chapter-content']", "[class*='content-text']",
     ".reader-content", "article .content",
+]
+
+_AI_PAYWALL_MARKERS = [
+    "ai translation requires registration",
+    "ai translation requires",
+    "guests can preview ai translation",
+    "sign up for free to continue",
+    "or click here to read with google",
 ]
 
 
@@ -60,29 +66,12 @@ def _is_cloudflare(html: str) -> bool:
     return "just a moment" in head or "cloudflare" in head or "cf-browser-verification" in head
 
 
-_AI_PAYWALL_MARKERS = [
-    "ai translation requires registration",
-    "ai translation requires",
-    "guests can preview ai translation",
-    "sign up for free to continue",
-    "or click here to read with google",
-    "تتطلب الترجمة بالذكاء الاصطناعي",
-    "يمكن للضيوف معاينة",
-]
-
-
 def _is_ai_paywall_block(html: str) -> bool:
-    """يكتشف تحديداً حالة كون المحتوى المُستخرج هو كتلة "AI Translation Requires
-    Registration" (تبويب AI الافتراضي المحظور للزوار) بدل محتوى الفصل الحقيقي.
-    هذا يختلف عن Cloudflare/404: الصفحة تُحمَّل بنجاح لكنها تعرض تبويب AI
-    بدل Web+ المطلوب، رغم تمرير service=webplus في الرابط."""
     head = html.lower()
     return any(marker in head for marker in _AI_PAYWALL_MARKERS)
 
 
 class _AiPaywallError(Exception):
-    """يُرفع عندما تكون الصفحة المُجلَبة هي كتلة AI المحظورة بدل المحتوى الحقيقي،
-    لتمييزها عن أخطاء الشبكة/404/Cloudflare العادية في scrape_chapter."""
     pass
 
 
@@ -92,6 +81,59 @@ async def _fetch_curl(url: str, timeout: int = 20) -> str:
         r = await session.get(url, timeout=timeout)
         r.raise_for_status()
         return r.text
+
+
+async def _fetch_playwright(url: str, timeout: int = 30) -> str:
+    """
+    جلب الصفحة بعد تنفيذ JavaScript الكامل عبر Playwright.
+    يضغط على تبويب Web+ إذا وُجد، ثم ينتظر ظهور محتوى الفصل.
+    """
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        raise RuntimeError("playwright غير مثبّت — أضف 'playwright' إلى requirements.txt")
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+        )
+        ctx = await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1280, "height": 800},
+        )
+        page = await ctx.new_page()
+
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
+
+            # محاولة الضغط على تبويب "Web+" إذا لم يكن محدداً بعد
+            try:
+                webplus_tab = page.locator("button:has-text('Web+'), [data-tab='webplus'], .tab-webplus")
+                if await webplus_tab.count() > 0:
+                    await webplus_tab.first.click()
+                    await page.wait_for_timeout(2000)
+            except Exception:
+                pass
+
+            # انتظار ظهور محتوى الفصل
+            try:
+                await page.wait_for_selector(
+                    ".chapter-content, .webplus-content, .serie-content, #chapter-content",
+                    timeout=10000,
+                )
+            except Exception:
+                pass  # نكمل حتى لو لم يُوجد
+
+            html = await page.content()
+        finally:
+            await browser.close()
+
+    return html
 
 
 def _extract_paragraphs(soup: BeautifulSoup):
@@ -152,7 +194,7 @@ def _extract_paragraphs(soup: BeautifulSoup):
 
 
 def _extract_next_data(html: str) -> dict | None:
-    """استخراج المحتوى من __NEXT_DATA__ JSON — لا يحتاج JS rendering"""
+    """استخراج من __NEXT_DATA__ JSON"""
     m = re.search(r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>', html, re.DOTALL)
     if not m:
         return None
@@ -177,8 +219,8 @@ def _extract_next_data(html: str) -> dict | None:
                     return r
         return None
 
-    content_raw   = find_key(data, "content", "chapterContent", "body", "text", "webplus")
-    chapter_title = find_key(data, "chapterTitle", "chapter_title", "chapterName")
+    content_raw   = find_key(data, "content", "chapterContent", "body", "text", "webplus", "paragraphs")
+    chapter_title = find_key(data, "chapterTitle", "chapter_title", "chapterName", "title")
     novel_title   = find_key(data, "novelTitle", "novel_title", "novelName", "serieName")
 
     if not content_raw:
@@ -199,7 +241,6 @@ def _extract_next_data(html: str) -> dict | None:
         return None
 
     paragraphs = [p for p in paragraphs if not any(w.lower() in p.lower() for w in _PAYWALL_WORDS)]
-
     if len(paragraphs) < 3:
         return None
 
@@ -208,11 +249,6 @@ def _extract_next_data(html: str) -> dict | None:
         "chapter_title": str(chapter_title) if chapter_title else None,
         "novel_title":   str(novel_title)   if novel_title   else None,
     }
-
-
-# ─── جلب slug الفصل من MtlNovel ──────────────────────────────
-async def getMtlNovelChapterUrl(novelSlug, chapterNum):
-    pass  # kept for compat
 
 
 async def search_novel(novel_name: str) -> dict:
@@ -259,78 +295,72 @@ async def search_novel(novel_name: str) -> dict:
 
 
 async def scrape_chapter(novel_id: str, novel_slug: str, chapter_num: int) -> dict:
-    # ملاحظة مهمة (مؤكدة من فحص يدوي للموقع):
-    #   /chapter-N                  → تبويب AI (الافتراضي — يطلب تسجيل دخول للزوار)
-    #   /chapter-N?service=webplus  → تبويب Web+  (يعمل بدون تسجيل)
-    #   /chapter-N?service=web      → تبويب Web   (يعمل بدون تسجيل)
-    # لذلك الرابط بدون أي service= هو فعلياً تبويب AI المحظور، وليس fallback آمناً.
-    # الترتيب أدناه يُجرّب webplus ثم web أولاً (كلاهما يعملان فعلياً)، ولا يلجأ
-    # للرابط العادي (AI) أو لمخطط serie-en القديم إلا كملاذ أخير عند فشل الاثنين
-    # الأوليين لسبب آخر (شبكة/404/Cloudflare) — وليس بسبب قفل AI.
-    candidate_urls = [
-        f"https://wtr-lab.com/en/novel/{novel_id}/{novel_slug}/chapter-{chapter_num}?service=webplus",
-        f"https://wtr-lab.com/en/novel/{novel_id}/{novel_slug}/chapter-{chapter_num}?service=web",
-        f"https://wtr-lab.com/en/serie-en/{novel_id}-{novel_slug}/chapter-{chapter_num}?service=webplus",
-        f"https://wtr-lab.com/en/serie-en/{novel_id}-{novel_slug}/chapter-{chapter_num}?service=web",
-        # الروابط بدون service= (AI) تُبقى كآخر ملاذ فقط — أي نجاح هنا يجب أن يُراجع
-        # لاحتمال كونه محتوى AI وليس Web+/Web الحقيقي.
-        f"https://wtr-lab.com/en/novel/{novel_id}/{novel_slug}/chapter-{chapter_num}",
-        f"https://wtr-lab.com/en/serie-en/{novel_id}-{novel_slug}/chapter-{chapter_num}",
+    """
+    استراتيجية الجلب:
+    1. curl_cffi مع ?service=webplus  → سريع، لا يحتاج JS
+    2. curl_cffi مع ?service=web      → سريع، لا يحتاج JS
+    3. Playwright مع ?service=webplus  → بطيء، ينفذ JS كاملاً
+    4. Playwright مع ?service=web      → بطيء، ينفذ JS كاملاً
+    """
+    base_url = f"https://wtr-lab.com/en/novel/{novel_id}/{novel_slug}/chapter-{chapter_num}"
+
+    # المرحلة 1: محاولات curl_cffi السريعة
+    curl_urls = [
+        f"{base_url}?service=webplus",
+        f"{base_url}?service=web",
     ]
-    last_error = None
-    ai_block_seen = False
-    for url in candidate_urls:
+    for url in curl_urls:
         try:
-            result = await _fetch_chapter_page(url, chapter_num)
-            if result and result.get("paragraphs"):
+            html = await _fetch_curl(url, timeout=20)
+            if _is_cloudflare(html):
+                continue
+            if _is_ai_paywall_block(html):
+                logger.warning(f"[WTR/curl] 🔒 {url}: AI paywall — تخطي")
+                continue
+            result = _parse_html(html, chapter_num, url)
+            if result:
+                logger.info(f"[WTR/curl] ✅ {url} — {result['paragraph_count']} فقرة")
                 return result
-        except _AiPaywallError as e:
-            ai_block_seen = True
-            logger.warning(f"[WTR/chapter] 🔒 {url}: تبويب AI محظور — تجربة رابط/تبويب آخر")
-            last_error = e
         except Exception as e:
-            logger.warning(f"[WTR/chapter] ❌ {url}: {e}")
-            last_error = e
+            logger.warning(f"[WTR/curl] ❌ {url}: {e}")
 
-    if ai_block_seen:
-        raise ValueError(
-            f"فشل كشط الفصل {chapter_num}: كل المحاولات أعادت تبويب AI المحظور "
-            f"للزوار (يتطلب تسجيل دخول) — {last_error}"
-        )
-    raise ValueError(f"فشل كشط الفصل {chapter_num}: {last_error}")
+    # المرحلة 2: Playwright (ينفذ JS)
+    playwright_urls = [
+        f"{base_url}?service=webplus",
+        f"{base_url}?service=web",
+    ]
+    for url in playwright_urls:
+        try:
+            logger.info(f"[WTR/playwright] 🌐 جاري تحميل {url} ...")
+            html = await _fetch_playwright(url, timeout=30)
+            if _is_cloudflare(html):
+                continue
+            if _is_ai_paywall_block(html):
+                logger.warning(f"[WTR/playwright] 🔒 {url}: AI paywall حتى بعد JS")
+                continue
+            result = _parse_html(html, chapter_num, url)
+            if result:
+                logger.info(f"[WTR/playwright] ✅ {url} — {result['paragraph_count']} فقرة")
+                return result
+        except RuntimeError as e:
+            # playwright غير مثبت
+            logger.warning(f"[WTR/playwright] ⚠️ {e}")
+            break
+        except Exception as e:
+            logger.warning(f"[WTR/playwright] ❌ {url}: {e}")
+
+    raise ValueError(
+        f"فشل كشط الفصل {chapter_num} من wtr-lab: "
+        "كل المحاولات (curl + Playwright) فشلت. "
+        "قد يتطلب الموقع تسجيل دخول أو يحظر الأتمتة."
+    )
 
 
-async def _fetch_chapter_page(url: str, chapter_num: int) -> dict:
-    # رابط بدون أي service= هو تبويب AI (مؤكد بالفحص اليدوي) — أي محتوى يُستخرج
-    # منه غير موثوق به كنص رواية حقيقي حتى لو تجاوز فلاتر القفل النصية، لأن AI قد
-    # يعيد ترجمته الخاصة (وليس Web/Web+) أو نصاً جزئياً بسبب حد المعاينة للزوار.
-    is_ai_tab = "service=" not in url
-
-    try:
-        html = await _fetch_curl(url, timeout=20)
-    except Exception as e:
-        raise ValueError(f"curl فشل: {e}")
-
-    if _is_cloudflare(html):
-        raise ValueError("Cloudflare تحظر الطلب")
-    if "404" in html[:2000] or "not found" in html[:2000].lower():
-        raise ValueError("404")
-    if _is_ai_paywall_block(html):
-        # الصفحة حُمِّلت بنجاح، لكنها تعرض تبويب AI المحظور للزوار غير المسجلين
-        # (راجع: "AI Translation Requires Registration") بدل تبويب Web/Web+
-        # المطلوب. هذا ليس فشل شبكة أو حظر Cloudflare — لذلك يُرفع استثناء
-        # مخصص يسمح لـ scrape_chapter بتمييزه وتجربة رابط/تبويب آخر مباشرة.
-        raise _AiPaywallError("الصفحة أعادت تبويب AI المحظور (يتطلب تسجيل دخول) بدل المحتوى المطلوب")
-    if is_ai_tab:
-        # احتياط إضافي: حتى لو لم يُكتشف نص القفل صريحاً (مثلاً ضمن أول 10 فصول
-        # المسموح للزوار معاينتها)، الرابط نفسه يستهدف تبويب AI لا Web+/Web —
-        # لذلك لا نعتمد عليه كمصدر أساسي ونرفع نفس الاستثناء لتفضيل بقية الروابط.
-        raise _AiPaywallError("الرابط يستهدف تبويب AI (بدون service=) — يُتجاهل لصالح webplus/web")
-
-    # ── محاولة 1: __NEXT_DATA__ JSON (لا يحتاج JS) ─────────────
+def _parse_html(html: str, chapter_num: int, url: str) -> dict | None:
+    """يحاول استخراج فقرات الفصل من HTML (بعد أو قبل JS rendering)."""
+    # محاولة 1: __NEXT_DATA__
     next_data = _extract_next_data(html)
     if next_data and len(next_data["paragraphs"]) >= 3:
-        logger.info(f"[WTR/chapter] ✅ __NEXT_DATA__ — {len(next_data['paragraphs'])} فقرة — {url}")
         return {
             "title":           next_data["novel_title"]   or "رواية",
             "chapter_title":   next_data["chapter_title"] or f"الفصل {chapter_num}",
@@ -339,17 +369,16 @@ async def _fetch_chapter_page(url: str, chapter_num: int) -> dict:
             "paragraph_count": len(next_data["paragraphs"]),
         }
 
-    # ── محاولة 2: HTML parsing مباشر ───────────────────────────
+    # محاولة 2: HTML parsing
     soup = BeautifulSoup(html, "lxml")
     paragraphs, chapter_title, novel_title = _extract_paragraphs(soup)
+    if len(paragraphs) >= 3:
+        return {
+            "title":           novel_title   or "رواية",
+            "chapter_title":   chapter_title or f"الفصل {chapter_num}",
+            "paragraphs":      paragraphs,
+            "url":             url,
+            "paragraph_count": len(paragraphs),
+        }
 
-    if len(paragraphs) < 3:
-        raise ValueError(f"محتوى فارغ ({len(paragraphs)} فقرة) — الموقع يحتاج JS rendering")
-
-    return {
-        "title":           novel_title   or "رواية",
-        "chapter_title":   chapter_title or f"الفصل {chapter_num}",
-        "paragraphs":      paragraphs,
-        "url":             url,
-        "paragraph_count": len(paragraphs),
-    }
+    return None
