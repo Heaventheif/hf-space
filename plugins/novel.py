@@ -1,6 +1,6 @@
 """
-plugins/novel.py — v3
-روايات: wtr-lab + novelbin + lightnovelworld كـ fallback
+plugins/novel.py — v4
+روايات: wtr-lab + readnovelfull + novelbin + lightnovelworld كـ fallback
 """
 import time
 import asyncio
@@ -15,13 +15,11 @@ from scrapers.wtr_lab import search_novel, scrape_chapter
 
 logger = logging.getLogger(__name__)
 
-DESCRIPTION     = "روايات: wtr-lab + novelbin + lightnovelworld"
+DESCRIPTION     = "روايات: wtr-lab (Playwright) + readnovelfull + novelbin + lightnovelworld"
 DOCKERFILE_DEPS = []
 
 
 async def _fetch_curl(url: str, timeout: int = 20) -> str:
-    """جلب الصفحة عبر curl_cffi مع تقليد متصفح حقيقي — يتجاوز حظر WAF/Cloudflare
-    الذي كان يرفض طلبات httpx العادية بـ 403."""
     from curl_cffi.requests import AsyncSession
     async with AsyncSession(impersonate="chrome124") as session:
         r = await session.get(url, timeout=timeout)
@@ -30,7 +28,66 @@ async def _fetch_curl(url: str, timeout: int = 20) -> str:
 
 
 # ═══════════════════════════════════════════════════
-# Novelbin Scraper (fallback 1)
+# ReadNovelFull Scraper (fallback 1) — أكثر موثوقية
+# ═══════════════════════════════════════════════════
+
+async def _rnf_search(query: str) -> dict | None:
+    """البحث في readnovelfull.com"""
+    try:
+        url  = f"https://readnovelfull.com/novel-list/search?keyword={quote(query)}"
+        html = await _fetch_curl(url, timeout=15)
+        soup = BeautifulSoup(html, "lxml")
+        # نتيجة البحث الأولى
+        item = soup.select_one(".col-novel-main .list-novel .novel-item, .list-novel li")
+        if not item:
+            return None
+        a = item.select_one("a[href]")
+        if not a:
+            return None
+        href  = a["href"]
+        # /novel-name.html  أو  /novel-name
+        slug  = href.rstrip("/").rstrip(".html").split("/")[-1]
+        title = a.get("title") or a.get_text(strip=True)
+        return {"title": title, "slug": slug, "source": "readnovelfull"}
+    except Exception as e:
+        logger.warning(f"[rnf/search] {e}")
+        return None
+
+
+async def _rnf_chapter(slug: str, chapter: int) -> dict | None:
+    """جلب الفصل من readnovelfull.com"""
+    try:
+        # الرابط: /slug/chapter-N.html
+        url  = f"https://readnovelfull.com/{slug}/chapter-{chapter}.html"
+        html = await _fetch_curl(url, timeout=20)
+        soup = BeautifulSoup(html, "lxml")
+        for el in soup.select("script,style,ins,.ads,#ads,.chapter-nav"):
+            el.decompose()
+        content = soup.select_one("#chr-content, #chapter-content, .chr-content")
+        if not content:
+            return None
+        paras = [
+            p.get_text(" ", strip=True)
+            for p in content.find_all("p")
+            if len(p.get_text(strip=True)) > 20
+        ]
+        if len(paras) < 3:
+            return None
+        title_el = soup.select_one(".chr-title, .chapter-title, h2, h1")
+        return {
+            "title": "رواية",
+            "chapter_title": title_el.get_text(strip=True) if title_el else f"الفصل {chapter}",
+            "paragraphs": paras,
+            "url": url,
+            "paragraph_count": len(paras),
+        }
+    except Exception as e:
+        logger.warning(f"[rnf/chapter] {e}")
+        return None
+
+
+# ═══════════════════════════════════════════════════
+# Novelbin Scraper (fallback 2)
 # ═══════════════════════════════════════════════════
 
 async def _novelbin_search(query: str) -> dict | None:
@@ -43,9 +100,8 @@ async def _novelbin_search(query: str) -> dict | None:
         a = item.select_one("a[href*='/novel/']")
         if not a:
             return None
-        title = a.get_text(strip=True)
-        slug  = a["href"].split("/novel/")[-1].rstrip("/")
-        return {"title": title, "slug": slug, "source": "novelbin"}
+        slug = a["href"].split("/novel/")[-1].rstrip("/")
+        return {"title": a.get_text(strip=True), "slug": slug, "source": "novelbin"}
     except Exception as e:
         logger.warning(f"[novelbin/search] {e}")
         return None
@@ -56,7 +112,6 @@ async def _novelbin_chapter(slug: str, chapter: int) -> dict | None:
         url  = f"https://novelbin.com/b/{slug}/chapter-{chapter}"
         html = await _fetch_curl(url, timeout=20)
         soup = BeautifulSoup(html, "lxml")
-        # إزالة العناصر غير المرغوبة
         for el in soup.select("script,style,ins,.ads,#ads,.chapter-nav,.navigation"):
             el.decompose()
         content = soup.select_one("#chr-content, #chapter-content, .chr-content, .chapter__content")
@@ -79,7 +134,7 @@ async def _novelbin_chapter(slug: str, chapter: int) -> dict | None:
 
 
 # ═══════════════════════════════════════════════════
-# LightNovelWorld Scraper (fallback 2)
+# LightNovelWorld Scraper (fallback 3)
 # ═══════════════════════════════════════════════════
 
 async def _lnw_search(query: str) -> dict | None:
@@ -129,7 +184,7 @@ async def _lnw_chapter(slug: str, chapter: int) -> dict | None:
 async def fetch_with_fallback(name: str, chapter: int) -> dict:
     errors = []
 
-    # 1. wtr-lab
+    # 1. wtr-lab (curl أولاً، ثم Playwright إن فشل)
     try:
         info = await search_novel(name)
         ch   = await scrape_chapter(info["id"], info["slug"], chapter)
@@ -142,7 +197,22 @@ async def fetch_with_fallback(name: str, chapter: int) -> dict:
         errors.append(f"wtr-lab: {e}")
         logger.warning(f"[novel/fallback] wtr-lab فشل: {e}")
 
-    # 2. novelbin
+    # 2. readnovelfull
+    try:
+        rnf = await _rnf_search(name)
+        if rnf:
+            ch = await _rnf_chapter(rnf["slug"], chapter)
+            if ch:
+                return {
+                    "source": "readnovelfull",
+                    "novel":  {"title": rnf["title"], "url": f"https://readnovelfull.com/{rnf['slug']}.html"},
+                    "chapter": ch,
+                }
+        errors.append("readnovelfull: لم يُجد نتائج أو فصلاً")
+    except Exception as e:
+        errors.append(f"readnovelfull: {e}")
+
+    # 3. novelbin
     try:
         nb = await _novelbin_search(name)
         if nb:
@@ -157,7 +227,7 @@ async def fetch_with_fallback(name: str, chapter: int) -> dict:
     except Exception as e:
         errors.append(f"novelbin: {e}")
 
-    # 3. lightnovelworld
+    # 4. lightnovelworld
     try:
         lnw = await _lnw_search(name)
         if lnw:
@@ -172,7 +242,7 @@ async def fetch_with_fallback(name: str, chapter: int) -> dict:
     except Exception as e:
         errors.append(f"lightnovelworld: {e}")
 
-    raise ValueError(f"كل المصادر فشلت:\n" + "\n".join(errors))
+    raise ValueError("كل المصادر فشلت:\n" + "\n".join(errors))
 
 
 # ═══════════════════════════════════════════════════
@@ -193,9 +263,9 @@ def register(app):
         start = time.time()
         try:
             result = await scrape_chapter(id, slug, chapter)
-            return JSONResponse({"success": True, "elapsed_seconds": round(time.time()-start,2), "data": result})
+            return JSONResponse({"success": True, "elapsed_seconds": round(time.time()-start, 2), "data": result})
         except Exception as e:
-            return JSONResponse({"success": False, "elapsed_seconds": round(time.time()-start,2), "error": str(e)}, status_code=500)
+            return JSONResponse({"success": False, "elapsed_seconds": round(time.time()-start, 2), "error": str(e)}, status_code=500)
 
     @app.get("/novel/fetch")
     async def novel_fetch(name: str = Query(...), chapter: int = Query(...)):
