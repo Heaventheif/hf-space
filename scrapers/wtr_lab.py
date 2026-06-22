@@ -190,7 +190,8 @@ async def getMtlNovelChapterUrl(novelSlug, chapterNum):
 
 
 async def search_novel(novel_name: str) -> dict:
-    search_url = f"https://wtr-lab.com/en/novel-finder?text={novel_name.replace(' ', '+')}"
+    from urllib.parse import quote
+    search_url = f"https://wtr-lab.com/en/novel-finder?text={quote(novel_name)}"
 
     try:
         html = await _fetch_curl(search_url, timeout=15)
@@ -232,7 +233,10 @@ async def search_novel(novel_name: str) -> dict:
 
 
 async def scrape_chapter(novel_id: str, novel_slug: str, chapter_num: int) -> dict:
-    # webplus أولاً في كل رابط
+    # webplus أولاً في كل رابط — نمط /novel/ هو الأكثر موثوقية ويُجرَّب أولاً.
+    # أنماط /serie-en/ قديمة وتُستخدم فقط لبعض الروايات؛ تُبقى كـ fallback أخير
+    # لأنها قد تنجح مع روايات أخرى حتى لو فشلت هنا (404 على /serie-en لا يعني
+    # أن المشكلة عامة — قد يكون الـ ID/slug غير مدعوم بهذا المخطط لهذه الرواية فقط).
     candidate_urls = [
         f"https://wtr-lab.com/en/novel/{novel_id}/{novel_slug}/chapter-{chapter_num}?service=webplus",
         f"https://wtr-lab.com/en/novel/{novel_id}/{novel_slug}/chapter-{chapter_num}",
