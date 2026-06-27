@@ -2,6 +2,7 @@
 plugins/hf.py
 endpoint: POST /hf
 HuggingFace Inference API — نصوص + صور + جلسات جماعية MongoDB
+مع Fallback تلقائي لـ Groq / Cerebras عند نفاد رصيد HF (402)
 """
 
 import os
@@ -16,8 +17,10 @@ logger = logging.getLogger(__name__)
 
 DESCRIPTION = "HuggingFace Inference API — نصوص + صور + جلسات جماعية"
 
-HF_TOKEN  = os.environ.get("HF_TOKEN", "")
-MONGO_URI = os.environ.get("MONGO_URI", "")
+HF_TOKEN      = os.environ.get("HF_TOKEN", "")
+MONGO_URI     = os.environ.get("MONGO_URI", "")
+GROQ_API_KEY  = os.environ.get("GROQ_API_KEY", "")
+CEREBRAS_KEY  = os.environ.get("CEREBRAS_API_KEY", "")
 
 SHORTCUTS: dict[str, str] = {
     "qwen":      "Qwen/Qwen2.5-72B-Instruct",
@@ -55,6 +58,116 @@ SYSTEM_PROMPT = (
     'كن ودوداً ومهذباً. '
     'لا تكتب أي تفكير أو تحليل داخلي، اكتب الجواب النهائي فقط مباشرة.'
 )
+
+# ═══════════════════════════════════════════════════════════════
+# Fallback providers — تُستخدَم عند فشل HF بـ 402 أو 503
+# ═══════════════════════════════════════════════════════════════
+
+# نماذج Groq المجانية المقابلة (أقرب ما يوجد)
+GROQ_FALLBACK_MODELS = [
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "mixtral-8x7b-32768",
+    "gemma2-9b-it",
+]
+
+# نماذج Cerebras المجانية
+CEREBRAS_FALLBACK_MODELS = [
+    "llama3.1-70b",
+    "llama3.1-8b",
+]
+
+def _call_groq_sync(messages_simple: list, max_tokens: int = 512) -> str:
+    """استدعاء Groq API كـ fallback — يجرّب نماذج متعددة"""
+    import httpx
+    key = GROQ_API_KEY.strip()
+    if not key:
+        raise RuntimeError("GROQ_API_KEY غير موجود")
+
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    }
+
+    for model in GROQ_FALLBACK_MODELS:
+        try:
+            resp = httpx.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers=headers,
+                json={
+                    "model": model,
+                    "messages": messages_simple,
+                    "max_tokens": max_tokens,
+                    "temperature": 0.7,
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            return clean_reply(resp.json()["choices"][0]["message"]["content"] or "")
+        except Exception as e:
+            logger.warning(f"[hf/groq-fallback] {model} فشل: {e}")
+            continue
+
+    raise RuntimeError("جميع نماذج Groq فشلت")
+
+
+def _call_cerebras_sync(messages_simple: list, max_tokens: int = 512) -> str:
+    """استدعاء Cerebras API كـ fallback ثانوي"""
+    import httpx
+    key = CEREBRAS_KEY.strip()
+    if not key:
+        raise RuntimeError("CEREBRAS_API_KEY غير موجود")
+
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    }
+
+    for model in CEREBRAS_FALLBACK_MODELS:
+        try:
+            resp = httpx.post(
+                "https://api.cerebras.ai/v1/chat/completions",
+                headers=headers,
+                json={
+                    "model": model,
+                    "messages": messages_simple,
+                    "max_tokens": max_tokens,
+                    "temperature": 0.7,
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            return clean_reply(resp.json()["choices"][0]["message"]["content"] or "")
+        except Exception as e:
+            logger.warning(f"[hf/cerebras-fallback] {model} فشل: {e}")
+            continue
+
+    raise RuntimeError("جميع نماذج Cerebras فشلت")
+
+
+def _is_quota_error(error: Exception) -> bool:
+    """هل الخطأ بسبب نفاد الرصيد أو عدم التوفر؟"""
+    msg = str(error).lower()
+    return any(k in msg for k in [
+        "402", "payment required", "depleted", "credits",
+        "quota", "rate limit", "429", "503", "service unavailable",
+    ])
+
+
+def _simple_messages(messages: list) -> list:
+    """تحويل الرسائل لصيغة نصية بسيطة (للـ fallback providers)"""
+    result = []
+    for m in messages:
+        role    = m.get("role", "user")
+        content = m.get("content", "")
+        if isinstance(content, list):
+            # vision content — استخرج النص فقط
+            text_parts = [p.get("text", "") for p in content if p.get("type") == "text"]
+            content = " ".join(text_parts) or "ما هذه الصورة؟"
+        if content:
+            result.append({"role": role, "content": str(content)})
+    return result
+
 
 # ─── MongoDB ──────────────────────────────────────────────────
 _db = None
@@ -109,9 +222,9 @@ def resolve_model(name: str) -> str:
     return name
 
 def clean_reply(text: str) -> str:
-    text = re.sub(r"<think>[\s\S]*?</think>",         "", text, flags=re.IGNORECASE)
-    text = re.sub(r"<thinking>[\s\S]*?</thinking>",   "", text, flags=re.IGNORECASE)
-    text = re.sub(r"<analysis>[\s\S]*?</analysis>",   "", text, flags=re.IGNORECASE)
+    text = re.sub(r"<think>[\s\S]*?</think>",          "", text, flags=re.IGNORECASE)
+    text = re.sub(r"<thinking>[\s\S]*?</thinking>",    "", text, flags=re.IGNORECASE)
+    text = re.sub(r"<analysis>[\s\S]*?</analysis>",    "", text, flags=re.IGNORECASE)
     text = re.sub(r"<reflection>[\s\S]*?</reflection>","", text, flags=re.IGNORECASE)
     match = re.search(r"(?:الجواب|الإجابة|Answer)\s*:\s*", text, flags=re.IGNORECASE)
     if match:
@@ -164,12 +277,54 @@ def _call_hf_sync(model_id: str, messages: list, max_tokens: int = 512) -> tuple
     return reply, actual_model
 
 
+def _call_with_fallback_sync(model_id: str, messages: list, max_tokens: int = 512) -> tuple[str, str]:
+    """
+    يجرّب HF أولاً، وعند فشله بـ 402/503 ينتقل تلقائياً لـ Groq ثم Cerebras.
+    """
+    # ── محاولة 1: HuggingFace ────────────────────────────────
+    try:
+        return _call_hf_sync(model_id, messages, max_tokens)
+    except Exception as hf_err:
+        if _is_quota_error(hf_err):
+            logger.warning(f"[hf] رصيد HF نفد ({hf_err}) — تحويل لـ Groq")
+        else:
+            raise  # خطأ غير متوقع → لا تخفيه
+
+    # تحضير رسائل بسيطة للـ fallback (بدون صور)
+    simple = _simple_messages(_build_messages(messages, model_id))
+    if not any(m["role"] == "system" for m in simple):
+        simple.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
+
+    # ── محاولة 2: Groq ───────────────────────────────────────
+    if GROQ_API_KEY.strip():
+        try:
+            reply = _call_groq_sync(simple, max_tokens)
+            logger.info("[hf] ✅ Groq fallback نجح")
+            return reply, "groq/llama-3.3-70b (fallback)"
+        except Exception as groq_err:
+            logger.warning(f"[hf] Groq fallback فشل: {groq_err}")
+
+    # ── محاولة 3: Cerebras ───────────────────────────────────
+    if CEREBRAS_KEY.strip():
+        try:
+            reply = _call_cerebras_sync(simple, max_tokens)
+            logger.info("[hf] ✅ Cerebras fallback نجح")
+            return reply, "cerebras/llama3.1-70b (fallback)"
+        except Exception as cb_err:
+            logger.warning(f"[hf] Cerebras fallback فشل: {cb_err}")
+
+    raise RuntimeError(
+        "نفد رصيد HuggingFace وفشلت جميع البدائل. "
+        "يرجى تجديد الاشتراك أو إضافة GROQ_API_KEY / CEREBRAS_API_KEY."
+    )
+
+
 def register(app):
 
     @app.post("/hf")
     async def hf_endpoint(request: Request):
         """
-        نمط الجلسات (جديد):
+        نمط الجلسات:
           { "thread_id": "group_123", "sender_name": "Ahmed", "prompt": "...",
             "model": "llama4", "clear": false,
             "attachment": { "kind": "image", "base64": "...", "contentType": "image/jpeg" } }
@@ -211,12 +366,11 @@ def register(app):
                 try:
                     loop = asyncio.get_event_loop()
                     reply, model_used = await loop.run_in_executor(
-                        None, _call_hf_sync, model_id, messages, max_tokens
+                        None, _call_with_fallback_sync, model_id, messages, max_tokens
                     )
                 except Exception as e:
                     return JSONResponse({"error": str(e), "model_used": model_id}, status_code=503)
 
-                # خزّن النص فقط (لا الصور) في السياق
                 att_label = "[صورة] " if attachment else ""
                 user_text = f"[{sender_name}]: {att_label}{prompt}".strip()
                 await _save(thread_id, [
@@ -240,7 +394,7 @@ def register(app):
             try:
                 loop = asyncio.get_event_loop()
                 reply, model_used = await loop.run_in_executor(
-                    None, _call_hf_sync, model_id, messages, max_tokens
+                    None, _call_with_fallback_sync, model_id, messages, max_tokens
                 )
                 return JSONResponse({"reply": reply, "model_used": model_used})
             except Exception as e:
@@ -254,8 +408,9 @@ def register(app):
     @app.get("/hf/models")
     async def hf_models():
         return JSONResponse({
-            "shortcuts": SHORTCUTS,
-            "vision_models": list(VISION_MODELS),
+            "shortcuts":       SHORTCUTS,
+            "vision_models":   list(VISION_MODELS),
             "vision_fallback": VISION_FALLBACK,
-            "default_model": "llama4",
+            "default_model":   "llama4",
+            "fallback_chain":  ["HuggingFace", "Groq", "Cerebras"],
         })
