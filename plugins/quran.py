@@ -36,10 +36,10 @@ def register(app):
             url = f"https://api.alquran.cloud/v1/ayah/{surah}:{ayah}/editions/quran-uthmani,ar.muyassar"
 
             r = await _http.get(url)
-                if r.status_code == 404:
-                    return JSONResponse({"error": f"الآية {surah}:{ayah} غير موجودة"}, status_code=404)
-                r.raise_for_status()
-                data = r.json()
+            if r.status_code == 404:
+                return JSONResponse({"error": f"الآية {surah}:{ayah} غير موجودة"}, status_code=404)
+            r.raise_for_status()
+            data = r.json()
 
             editions = data.get("data", [])
             if len(editions) < 2:

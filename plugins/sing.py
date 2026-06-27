@@ -50,8 +50,8 @@ def register(app):
                 "https://api.ferdev.my.id/search/soundcloud",
                 params={"query": query, "apikey": _key()},
             )
-                r.raise_for_status()
-                data = r.json()
+            r.raise_for_status()
+            data = r.json()
 
             items = data.get("result", [])
             results = []

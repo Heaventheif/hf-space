@@ -40,8 +40,8 @@ def register(app):
                 "https://translate.googleapis.com/translate_a/single",
                 params={"client": "gtx", "sl": "auto", "tl": to, "dt": "t", "q": text},
             )
-                r.raise_for_status()
-                data = r.json()
+            r.raise_for_status()
+            data = r.json()
 
             translated = "".join(
                 part[0] for part in data[0] if part[0]

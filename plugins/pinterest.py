@@ -41,8 +41,8 @@ def register(app):
                 params={"query": query, "apikey": key},
                 headers={"User-Agent": "SunkenBot/2.0"},
             )
-                r.raise_for_status()
-                data = r.json()
+            r.raise_for_status()
+            data = r.json()
 
             results = data.get("result", [])
             if not results:

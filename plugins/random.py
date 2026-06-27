@@ -93,9 +93,9 @@ def register(app):
         # حاول تحميل الفيديو
         try:
             dl = await _http_dl.get(video_url, headers={"User-Agent": "Mozilla/5.0"})
-                if dl.status_code != 200:
-                    raise Exception("فشل التحميل")
-                content = dl.content
+            if dl.status_code != 200:
+                raise Exception("فشل التحميل")
+            content = dl.content
 
             if not content:
                 raise Exception("الملف فارغ")
