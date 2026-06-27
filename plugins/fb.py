@@ -8,6 +8,17 @@ from fastapi.responses import JSONResponse
 
 DESCRIPTION = "تحميل فيديوهات فيسبوك"
 
+# ─── Shared HTTP clients (connection pooling) ──────────────────
+_http = httpx.AsyncClient(
+    timeout=30,
+    limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+)
+_http_dl = httpx.AsyncClient(
+    timeout=120,
+    follow_redirects=True,
+    limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
+)
+
 FDOWN    = "https://facebook-video-download-api.onrender.com"
 MAX_BYTES = 25 * 1024 * 1024
 
@@ -76,14 +87,13 @@ def _is_facebook_video_url(url: str) -> bool:
 
 
 async def _get_video_url(fb_url: str, quality: str) -> dict:
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(
-            f"{FDOWN}/download",
-            json={"url": fb_url, "quality": quality},
-            headers={"Content-Type": "application/json"},
-        )
-        r.raise_for_status()
-        data = r.json()
+    r = await _http.post(
+        f"{FDOWN}/download",
+        json={"url": fb_url, "quality": quality},
+        headers={"Content-Type": "application/json"},
+    )
+    r.raise_for_status()
+    data = r.json()
     return {
         "video_url": data.get("download_url") or (data.get("available_formats") or [{}])[0].get("url"),
         "title":     data.get("video_info", {}).get("title", "فيديو فيسبوك"),
@@ -142,10 +152,9 @@ def register(app):
             title     = result["title"]
 
             # حاول تحميل الفيديو
-            async with httpx.AsyncClient(timeout=120) as client:
-                dl = await client.get(video_url, follow_redirects=True)
-                dl.raise_for_status()
-                content = dl.content
+            dl = await _http_dl.get(video_url)
+            dl.raise_for_status()
+            content = dl.content
 
             if not content:
                 return JSONResponse({"error": "الملف فارغ"}, status_code=502)
@@ -156,9 +165,8 @@ def register(app):
                     try:
                         r2 = await _get_video_url(fb_url, "worst")
                         if r2["video_url"]:
-                            async with httpx.AsyncClient(timeout=120) as client:
-                                dl2 = await client.get(r2["video_url"], follow_redirects=True)
-                                content2 = dl2.content
+                            dl2 = await _http_dl.get(r2["video_url"])
+                            content2 = dl2.content
                             if content2 and len(content2) <= MAX_BYTES:
                                 return JSONResponse({
                                     "video_b64": base64.b64encode(content2).decode(),

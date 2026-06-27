@@ -28,6 +28,12 @@ logger = logging.getLogger("mood_sticker")
 
 DESCRIPTION = "يصنّف مزاج الأغنية عبر LLM ويرجع GIF مناسب من Giphy"
 
+# ─── Shared HTTP client (connection pooling) ──────────────────
+_http = httpx.AsyncClient(
+    timeout=15,
+    limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
+)
+
 DOCKERFILE_DEPS = ["httpx"]
 
 # ─── قائمة موسّعة من الفئات (مزاج + نوع + ثقافة) ─────────────────
@@ -128,11 +134,10 @@ async def classify_mood(title: str) -> str:
 
     prompt = _build_prompt(title)
     try:
-        async with httpx.AsyncClient() as client:
-            if AI_PROVIDER == "gemini":
-                raw = await _classify_via_gemini(client, cfg, prompt)
-            else:
-                raw = await _classify_via_openai_compatible(client, cfg, prompt)
+        if AI_PROVIDER == "gemini":
+            raw = await _classify_via_gemini(_http, cfg, prompt)
+        else:
+            raw = await _classify_via_openai_compatible(_http, cfg, prompt)
 
         mood = raw.lower().strip().strip(".").strip('"')
         # تأكيد أن الفئة معقولة (تطابق تقريبي مع القائمة أو نص قصير)
@@ -145,36 +150,30 @@ async def classify_mood(title: str) -> str:
 
 
 async def fetch_giphy_gif(mood: str) -> bytes:
+    import random
     giphy_key = os.environ.get("GIPHY_API_KEY", "")
     if not giphy_key:
         raise HTTPException(status_code=500, detail="GIPHY_API_KEY غير مضبوط")
 
     query = f"{mood} dance"
 
-    async with httpx.AsyncClient() as client:
-        search_res = await client.get(
-            GIPHY_SEARCH_URL,
-            params={
-                "api_key": giphy_key,
-                "q": query,
-                "limit": 10,
-                "rating": "pg-13",
-            },
-            timeout=10.0,
-        )
-        search_res.raise_for_status()
-        results = search_res.json().get("data", [])
+    search_res = await _http.get(
+        GIPHY_SEARCH_URL,
+        params={"api_key": giphy_key, "q": query, "limit": 10, "rating": "pg-13"},
+        timeout=10.0,
+    )
+    search_res.raise_for_status()
+    results = search_res.json().get("data", [])
 
-        if not results:
-            raise HTTPException(status_code=404, detail=f"لا نتائج Giphy لـ: {query}")
+    if not results:
+        raise HTTPException(status_code=404, detail=f"لا نتائج Giphy لـ: {query}")
 
-        import random
-        chosen = random.choice(results)
-        gif_url = chosen["images"]["downsized"]["url"]
+    chosen = random.choice(results)
+    gif_url = chosen["images"]["downsized"]["url"]
 
-        gif_res = await client.get(gif_url, timeout=15.0)
-        gif_res.raise_for_status()
-        return gif_res.content
+    gif_res = await _http.get(gif_url, timeout=15.0)
+    gif_res.raise_for_status()
+    return gif_res.content
 
 
 def register(app):

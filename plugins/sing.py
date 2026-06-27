@@ -8,6 +8,17 @@ from fastapi.responses import JSONResponse
 
 DESCRIPTION = "البحث والتحميل من SoundCloud"
 
+# ─── Shared HTTP clients (connection pooling) ──────────────────
+_http = httpx.AsyncClient(
+    timeout=20,
+    limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
+)
+_http_dl = httpx.AsyncClient(
+    timeout=90,
+    follow_redirects=True,
+    limits=httpx.Limits(max_keepalive_connections=3, max_connections=5),
+)
+
 FERDEV_KEYS = [k for k in [
     os.environ.get("FERDEV_API_KEY"),
     os.environ.get("FERDEV_API_KEY2"),
@@ -35,11 +46,10 @@ def register(app):
             if not query:
                 return JSONResponse({"error": "query مطلوب"}, status_code=400)
 
-            async with httpx.AsyncClient(timeout=20) as client:
-                r = await client.get(
-                    "https://api.ferdev.my.id/search/soundcloud",
-                    params={"query": query, "apikey": _key()},
-                )
+            r = await _http.get(
+                "https://api.ferdev.my.id/search/soundcloud",
+                params={"query": query, "apikey": _key()},
+            )
                 r.raise_for_status()
                 data = r.json()
 
@@ -73,13 +83,12 @@ def register(app):
             if not url:
                 return JSONResponse({"error": "url مطلوب"}, status_code=400)
 
-            async with httpx.AsyncClient(timeout=20) as client:
-                dl = await client.get(
-                    "https://api.ferdev.my.id/downloader/soundcloud",
-                    params={"link": url, "apikey": _key()},
-                )
-                dl.raise_for_status()
-                dl_data = dl.json()
+            dl = await _http.get(
+                "https://api.ferdev.my.id/downloader/soundcloud",
+                params={"link": url, "apikey": _key()},
+            )
+            dl.raise_for_status()
+            dl_data = dl.json()
 
             download_url = (
                 dl_data.get("result", {}).get("downloadUrl")
@@ -89,14 +98,12 @@ def register(app):
             if not download_url:
                 return JSONResponse({"error": "لم يُرجع الـ API رابط تحميل"}, status_code=502)
 
-            async with httpx.AsyncClient(timeout=90) as client:
-                audio = await client.get(
-                    download_url,
-                    headers={"User-Agent": "Mozilla/5.0"},
-                    follow_redirects=True,
-                )
-                audio.raise_for_status()
-                raw = audio.content
+            audio = await _http_dl.get(
+                download_url,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            audio.raise_for_status()
+            raw = audio.content
 
             if not raw:
                 return JSONResponse({"error": "الملف فارغ"}, status_code=502)

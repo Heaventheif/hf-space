@@ -10,6 +10,17 @@ from fastapi.responses import JSONResponse
 
 DESCRIPTION = "GPT-4o — جلسات جماعية + دعم الصور"
 
+# ─── Shared HTTP clients (connection pooling) ──────────────────
+_http = httpx.AsyncClient(
+    timeout=30,
+    limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+)
+_http_dl = httpx.AsyncClient(
+    timeout=15,
+    follow_redirects=True,
+    limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
+)
+
 GITHUB_TOKEN = os.environ.get("GITHUB_MODELS_TOKEN", "")
 MONGO_URI    = os.environ.get("MONGO_URI", "")
 
@@ -94,11 +105,10 @@ def register(app):
             if has_image:
                 # حمّل الصورة إذا وُجد رابط
                 if image_url and not image_b64:
-                    async with httpx.AsyncClient(timeout=15) as client:
-                        img_r = await client.get(image_url, headers={"User-Agent": "Mozilla/5.0"})
-                        img_r.raise_for_status()
-                        image_b64  = base64.b64encode(img_r.content).decode()
-                        image_type = img_r.headers.get("content-type", "image/jpeg")
+                    img_r = await _http_dl.get(image_url, headers={"User-Agent": "Mozilla/5.0"})
+                    img_r.raise_for_status()
+                    image_b64  = base64.b64encode(img_r.content).decode()
+                    image_type = img_r.headers.get("content-type", "image/jpeg")
 
                 user_content = [
                     {
@@ -123,28 +133,27 @@ def register(app):
                 {"role": "user", "content": user_content},
             ]
 
-            async with httpx.AsyncClient(timeout=30) as client:
-                r = await client.post(
-                    "https://models.inference.ai.azure.com/chat/completions",
-                    json={
-                        "model":       "gpt-4o",
-                        "messages":    messages,
-                        "temperature": 0.7,
-                        "max_tokens":  2048,
-                    },
-                    headers={
-                        "Authorization": f"Bearer {GITHUB_TOKEN}",
-                        "Content-Type":  "application/json",
-                    },
-                )
-                if r.status_code == 401:
-                    return JSONResponse({"error": "GITHUB_MODELS_TOKEN غير صالح"}, status_code=401)
-                if r.status_code == 429:
-                    return JSONResponse({"error": "تجاوزت الحد اليومي لـ GitHub Models"}, status_code=429)
-                if r.status_code == 404:
-                    return JSONResponse({"error": "النموذج غير متاح"}, status_code=404)
-                r.raise_for_status()
-                data = r.json()
+            r = await _http.post(
+                "https://models.inference.ai.azure.com/chat/completions",
+                json={
+                    "model":       "gpt-4o",
+                    "messages":    messages,
+                    "temperature": 0.7,
+                    "max_tokens":  2048,
+                },
+                headers={
+                    "Authorization": f"Bearer {GITHUB_TOKEN}",
+                    "Content-Type":  "application/json",
+                },
+            )
+            if r.status_code == 401:
+                return JSONResponse({"error": "GITHUB_MODELS_TOKEN غير صالح"}, status_code=401)
+            if r.status_code == 429:
+                return JSONResponse({"error": "تجاوزت الحد اليومي لـ GitHub Models"}, status_code=429)
+            if r.status_code == 404:
+                return JSONResponse({"error": "النموذج غير متاح"}, status_code=404)
+            r.raise_for_status()
+            data = r.json()
 
             reply = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
             if not reply:

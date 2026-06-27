@@ -11,6 +11,17 @@ from fastapi.responses import JSONResponse
 
 DESCRIPTION = "Llama 4 Scout — Vision + Audio + Video + جلسات جماعية + Gemini fallback"
 
+# ─── Shared HTTP clients (connection pooling) ─────────────────
+_http = httpx.AsyncClient(
+    timeout=30,
+    limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+)
+_http_dl = httpx.AsyncClient(
+    timeout=120,
+    follow_redirects=True,
+    limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
+)
+
 GROQ_KEY = os.environ.get("GROQ_API_KEY")
 MONGO_URI = os.environ.get("MONGO_URI", "")
 GEMINI_KEYS = [k for k in [
@@ -71,11 +82,10 @@ async def _clear(thread_id: str):
 
 # ─── Media helpers ────────────────────────────────────────────
 async def _fetch_base64(url: str) -> tuple[bytes, str]:
-    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-        r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
-        r.raise_for_status()
-        raw = r.content
-        return raw, base64.b64encode(raw).decode()
+    r = await _http_dl.get(url, headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    raw = r.content
+    return raw, base64.b64encode(raw).decode()
 
 def _guess_mime(url: str, raw: bytes) -> str:
     url_low = url.lower().split("?")[0]
@@ -98,16 +108,15 @@ def _guess_mime(url: str, raw: bytes) -> str:
 async def _groq_text(messages: list) -> str:
     if not GROQ_KEY:
         raise RuntimeError("NO_GROQ_KEY")
-    async with httpx.AsyncClient(timeout=30) as c:
-        r = await c.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {GROQ_KEY}"},
-            json={"model": LLAMA4_MODEL, "messages": messages, "max_tokens": 1024, "temperature": 0.7}
-        )
-        r.raise_for_status()
-        reply = r.json()["choices"][0]["message"]["content"]
-        if not reply: raise RuntimeError("EMPTY")
-        return reply
+    r = await _http.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={"Authorization": f"Bearer {GROQ_KEY}"},
+        json={"model": LLAMA4_MODEL, "messages": messages, "max_tokens": 1024, "temperature": 0.7}
+    )
+    r.raise_for_status()
+    reply = r.json()["choices"][0]["message"]["content"]
+    if not reply: raise RuntimeError("EMPTY")
+    return reply
 
 async def _groq_vision(messages: list, img_b64: str, mime: str) -> str:
     if not GROQ_KEY:
@@ -122,16 +131,16 @@ async def _groq_vision(messages: list, img_b64: str, mime: str) -> str:
             ]})
         else:
             groq_msgs.append(m)
-    async with httpx.AsyncClient(timeout=45) as c:
-        r = await c.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {GROQ_KEY}"},
-            json={"model": LLAMA4_MODEL, "messages": groq_msgs, "max_tokens": 1024}
-        )
-        r.raise_for_status()
-        reply = r.json()["choices"][0]["message"]["content"]
-        if not reply: raise RuntimeError("EMPTY")
-        return reply
+    r = await _http.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={"Authorization": f"Bearer {GROQ_KEY}"},
+        json={"model": LLAMA4_MODEL, "messages": groq_msgs, "max_tokens": 1024},
+        timeout=45,
+    )
+    r.raise_for_status()
+    reply = r.json()["choices"][0]["message"]["content"]
+    if not reply: raise RuntimeError("EMPTY")
+    return reply
 
 async def _groq_audio(audio_raw: bytes, mime: str, prompt: str) -> str:
     if not GROQ_KEY:
@@ -142,17 +151,17 @@ async def _groq_audio(audio_raw: bytes, mime: str, prompt: str) -> str:
         "audio/webm": "webm", "audio/flac": "flac",
     }
     ext = ext_map.get(mime, "mp3")
-    async with httpx.AsyncClient(timeout=60) as c:
-        r = await c.post(
-            "https://api.groq.com/openai/v1/audio/transcriptions",
-            headers={"Authorization": f"Bearer {GROQ_KEY}"},
-            files={"file": (f"audio.{ext}", audio_raw, mime)},
-            data={"model": WHISPER_MODEL, "language": "ar", "response_format": "text"},
-        )
-        r.raise_for_status()
-        transcription = r.text.strip()
-        if not transcription:
-            raise RuntimeError("EMPTY_TRANSCRIPTION")
+    r = await _http.post(
+        "https://api.groq.com/openai/v1/audio/transcriptions",
+        headers={"Authorization": f"Bearer {GROQ_KEY}"},
+        files={"file": (f"audio.{ext}", audio_raw, mime)},
+        data={"model": WHISPER_MODEL, "language": "ar", "response_format": "text"},
+        timeout=60,
+    )
+    r.raise_for_status()
+    transcription = r.text.strip()
+    if not transcription:
+        raise RuntimeError("EMPTY_TRANSCRIPTION")
     follow_up = prompt.strip() or "لخص ما قيل في هذا الصوت"
     text_msgs = [
         {"role": "system", "content": SYSTEM},
@@ -191,24 +200,24 @@ async def _gemini_fallback(messages: list) -> str:
         role = "model" if m["role"] == "assistant" else "user"
         content = m["content"] if isinstance(m["content"], str) else str(m.get("content", ""))
         contents.append({"role": role, "parts": [{"text": content}]})
-    async with httpx.AsyncClient(timeout=25) as c:
-        for key in GEMINI_KEYS:
-            try:
-                r = await c.post(
-                    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
-                    headers={"Content-Type": "application/json", "X-goog-api-key": key},
-                    json={
-                        "systemInstruction": {"parts": [{"text": SYSTEM}]},
-                        "contents": contents,
-                        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 1024},
-                    }
-                )
-                if r.status_code == 429: continue
-                r.raise_for_status()
-                reply = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-                if reply: return reply
-            except Exception:
-                continue
+    for key in GEMINI_KEYS:
+        try:
+            r = await _http.post(
+                "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
+                headers={"Content-Type": "application/json", "X-goog-api-key": key},
+                json={
+                    "systemInstruction": {"parts": [{"text": SYSTEM}]},
+                    "contents": contents,
+                    "generationConfig": {"temperature": 0.7, "maxOutputTokens": 1024},
+                },
+                timeout=25,
+            )
+            if r.status_code == 429: continue
+            r.raise_for_status()
+            reply = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+            if reply: return reply
+        except Exception:
+            continue
     raise RuntimeError("ALL_GEMINI_EXHAUSTED")
 
 

@@ -11,6 +11,12 @@ from fastapi.responses import JSONResponse
 DESCRIPTION = "Cerebras GPT OSS — جلسات جماعية"
 
 CEREBRAS_KEY = os.environ.get("CEREBRAS_API_KEY", "")
+
+# ─── Shared HTTP client (connection pooling) ──────────────────
+_http = httpx.AsyncClient(
+    timeout=30,
+    limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+)
 MONGO_URI    = os.environ.get("MONGO_URI", "")
 
 SYSTEM = 'أنت بوت مساعد ذكي اسمك "Sunken". أجب دائماً باللغة العربية بإيجاز (أقل من 300 كلمة). كن ودوداً ومهذباً.'
@@ -105,27 +111,26 @@ def register(app):
                 {"role": "user", "content": user_content},
             ]
 
-            async with httpx.AsyncClient(timeout=30) as client:
-                r = await client.post(
-                    "https://api.cerebras.ai/v1/chat/completions",
-                    json={
-                        "model":                  model,
-                        "messages":               messages,
-                        "max_completion_tokens":  1024,
-                        "temperature":            0.7,
-                        "stream":                 False,
-                    },
-                    headers={
-                        "Authorization": f"Bearer {CEREBRAS_KEY}",
-                        "Content-Type":  "application/json",
-                    },
-                )
-                if r.status_code == 401:
-                    return JSONResponse({"error": "CEREBRAS_API_KEY غير صالح"}, status_code=401)
-                if r.status_code == 429:
-                    return JSONResponse({"error": "تجاوزت حد الطلبات، انتظر قليلاً"}, status_code=429)
-                r.raise_for_status()
-                data = r.json()
+            r = await _http.post(
+                "https://api.cerebras.ai/v1/chat/completions",
+                json={
+                    "model":                  model,
+                    "messages":               messages,
+                    "max_completion_tokens":  1024,
+                    "temperature":            0.7,
+                    "stream":                 False,
+                },
+                headers={
+                    "Authorization": f"Bearer {CEREBRAS_KEY}",
+                    "Content-Type":  "application/json",
+                },
+            )
+            if r.status_code == 401:
+                return JSONResponse({"error": "CEREBRAS_API_KEY غير صالح"}, status_code=401)
+            if r.status_code == 429:
+                return JSONResponse({"error": "تجاوزت حد الطلبات، انتظر قليلاً"}, status_code=429)
+            r.raise_for_status()
+            data = r.json()
 
             reply = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
             if not reply:

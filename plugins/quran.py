@@ -8,6 +8,12 @@ from fastapi.responses import JSONResponse
 
 DESCRIPTION = "جلب الآيات القرآنية مع التفسير الميسر"
 
+# ─── Shared HTTP client (connection pooling) ──────────────────
+_http = httpx.AsyncClient(
+    timeout=15,
+    limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
+)
+
 
 def register(app):
 
@@ -29,8 +35,7 @@ def register(app):
 
             url = f"https://api.alquran.cloud/v1/ayah/{surah}:{ayah}/editions/quran-uthmani,ar.muyassar"
 
-            async with httpx.AsyncClient(timeout=15) as client:
-                r = await client.get(url)
+            r = await _http.get(url)
                 if r.status_code == 404:
                     return JSONResponse({"error": f"الآية {surah}:{ayah} غير موجودة"}, status_code=404)
                 r.raise_for_status()

@@ -8,6 +8,12 @@ from fastapi.responses import JSONResponse
 
 DESCRIPTION = "ترجمة النصوص عبر Google Translate"
 
+# ─── Shared HTTP client (connection pooling) ──────────────────
+_http = httpx.AsyncClient(
+    timeout=15,
+    limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
+)
+
 
 def register(app):
 
@@ -30,11 +36,10 @@ def register(app):
                 f"?client=gtx&sl=auto&tl={to}&dt=t&q={httpx.URL(text)}"
             )
 
-            async with httpx.AsyncClient(timeout=15) as client:
-                r = await client.get(
-                    "https://translate.googleapis.com/translate_a/single",
-                    params={"client": "gtx", "sl": "auto", "tl": to, "dt": "t", "q": text},
-                )
+            r = await _http.get(
+                "https://translate.googleapis.com/translate_a/single",
+                params={"client": "gtx", "sl": "auto", "tl": to, "dt": "t", "q": text},
+            )
                 r.raise_for_status()
                 data = r.json()
 

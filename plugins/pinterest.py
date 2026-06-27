@@ -9,6 +9,12 @@ from fastapi.responses import JSONResponse
 
 DESCRIPTION = "البحث عن صور من Pinterest"
 
+# ─── Shared HTTP client (connection pooling) ──────────────────
+_http = httpx.AsyncClient(
+    timeout=30,
+    limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
+)
+
 FERDEV_KEY = os.environ.get("FERDEV_API_KEY", "")
 
 
@@ -30,12 +36,11 @@ def register(app):
 
             key = FERDEV_KEY or "FREE"
 
-            async with httpx.AsyncClient(timeout=30) as client:
-                r = await client.get(
-                    "https://api.ferdev.my.id/search/pinterest",
-                    params={"query": query, "apikey": key},
-                    headers={"User-Agent": "SunkenBot/2.0"},
-                )
+            r = await _http.get(
+                "https://api.ferdev.my.id/search/pinterest",
+                params={"query": query, "apikey": key},
+                headers={"User-Agent": "SunkenBot/2.0"},
+            )
                 r.raise_for_status()
                 data = r.json()
 

@@ -8,6 +8,17 @@ from fastapi.responses import JSONResponse
 
 DESCRIPTION = "فيديو عشوائي من Tumblr"
 
+# ─── Shared HTTP clients (connection pooling) ──────────────────
+_http = httpx.AsyncClient(
+    timeout=10,
+    limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
+)
+_http_dl = httpx.AsyncClient(
+    timeout=60,
+    follow_redirects=True,
+    limits=httpx.Limits(max_keepalive_connections=3, max_connections=5),
+)
+
 TUMBLR_KEY = os.environ.get("TUMBLR_API_KEY", "")
 MAX_BYTES  = 25 * 1024 * 1024
 
@@ -37,8 +48,7 @@ def register(app):
 
         video_url = caption = blog_name = post_url = None
 
-        async with httpx.AsyncClient(timeout=10) as client:
-            for blog in shuffled:
+        async for blog in _aiter(shuffled):
                 try:
                     offset = random.randint(0, 20)
                     r = await client.get(
@@ -82,8 +92,7 @@ def register(app):
 
         # حاول تحميل الفيديو
         try:
-            async with httpx.AsyncClient(timeout=60) as client:
-                dl = await client.get(video_url, headers={"User-Agent": "Mozilla/5.0"}, follow_redirects=True)
+            dl = await _http_dl.get(video_url, headers={"User-Agent": "Mozilla/5.0"})
                 if dl.status_code != 200:
                     raise Exception("فشل التحميل")
                 content = dl.content

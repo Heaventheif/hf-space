@@ -14,6 +14,12 @@ from google.genai import types
 
 DESCRIPTION = "Gemini 2.5 Flash (Google Search Grounding) — جلسات جماعية + Groq fallback"
 
+# ─── Shared HTTP client (connection pooling) ──────────────────
+_http = httpx.AsyncClient(
+    timeout=25,
+    limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+)
+
 GEMINI_KEYS = [k for k in [
     os.environ.get("GEMINI_API_KEY"),
     os.environ.get("GEMINI_API_KEY_2"),
@@ -109,14 +115,13 @@ async def _call_gemini(messages: list) -> str:
 async def _call_groq(messages: list) -> str:
     if not GROQ_KEY:
         raise RuntimeError("NO_GROQ_KEY")
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
-            json={"model": "llama-3.3-70b-versatile", "messages": messages, "max_tokens": 1024, "temperature": 0.7}
-        )
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"]
+    r = await _http.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
+        json={"model": "llama-3.3-70b-versatile", "messages": messages, "max_tokens": 1024, "temperature": 0.7}
+    )
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"]
 
 
 def register(app):
