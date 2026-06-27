@@ -1,3 +1,11 @@
+---
+title: Sunken Bot
+emoji: 🤖
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+pinned: false
+---
 # 🤖 Sunken Bot — Universal Bot API
 
 <div align="center">
