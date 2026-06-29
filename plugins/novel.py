@@ -142,7 +142,7 @@ async def fetch_js(url: str, wait_sel: str = None, timeout: int = 25000) -> Opti
                     try:
                         await page.wait_for_selector(wait_sel, timeout=10000)
                     except Exception:
-                        pass  # قد يكون المحتوى موجوداً بدون انتظار selector معين
+                        pass
                 html = await page.content()
                 return html if len(html) > 500 else None
             finally:
@@ -152,7 +152,6 @@ async def fetch_js(url: str, wait_sel: str = None, timeout: int = 25000) -> Opti
         return None
 
 # ─── تعريف المواقع (JS فقط) ────────────────────────────────────
-# كل هذه المواقع تحتاج Playwright — axios لا يراها
 SITES = [
     {
         "name": "NovelHi",
@@ -163,13 +162,13 @@ SITES = [
     },
     {
         "name": "WtrLab",
-        "needs_id": True,  # يحتاج resolve أولاً
+        "needs_id": True,
         "search_url": lambda name: f"https://wtr-lab.com/en/novel-list?search={name.replace(' ', '+')}",
         "id_pattern": re.compile(r"/en/novel/(\d+)/"),
         "build_url": lambda novel_id, ch: f"https://wtr-lab.com/en/novel/{novel_id}/chapter-{ch}",
         "wait_sel": ".chapter-sentences, .chapter-content, div[class*='chapter']",
         "selectors": [
-            ".chapter-sentences",      # WtrLab الحديث
+            ".chapter-sentences",
             ".chapter-content",
             "div[class*='sentence']",
             "div[class*='chapter-text']",
@@ -196,7 +195,6 @@ async def resolve_wtrlab_id(novel_name: str) -> Optional[str]:
     soup = BeautifulSoup(html, "lxml")
     pat = re.compile(r"/en/novel/(\d+)/")
 
-    # كلمات الاسم للمطابقة (تجاهل الكلمات القصيرة)
     name_words = [w.lower() for w in novel_name.split() if len(w) > 2]
 
     best_id = None
@@ -207,7 +205,6 @@ async def resolve_wtrlab_id(novel_name: str) -> Optional[str]:
         m = pat.search(href)
         if not m:
             continue
-        # نص الرابط + الـ href معاً للمطابقة
         link_text = (a.get_text() + " " + href).lower()
         score = sum(1 for w in name_words if w in link_text)
         if score > best_score:
@@ -216,7 +213,6 @@ async def resolve_wtrlab_id(novel_name: str) -> Optional[str]:
         if score == len(name_words):
             break
 
-    # اقبل فقط إذا طابق نصف الكلمات على الأقل
     if best_id and best_score >= max(1, len(name_words) // 2):
         _cache_set(key, best_id)
         logger.info(f"[WtrLab] ID لـ '{novel_name}' = {best_id} (score={best_score}/{len(name_words)})")
@@ -260,6 +256,256 @@ async def fetch_from_site(site: dict, novel_name: str, chapter_num: int) -> dict
     _cache_set(key, result)
     return result
 
+
+# ══════════════════════════════════════════════════════════════════
+# ─── Probe / Discovery ────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
+
+# أنماط URL الشائعة في مواقع الروايات — يُجرَّب كلٌّ منها بالترتيب
+# {slug}   = slugified novel name  (martial-peak)
+# {pascal} = Pascal-slugified name (Martial-Peak)
+# {raw}    = الاسم كما هو بعد استبدال المسافات بـ +
+# {ch}     = رقم الفصل
+URL_PATTERNS = [
+    "{base}/{slug}/chapter-{ch}",
+    "{base}/{slug}/chapter_{ch}",
+    "{base}/{slug}/{ch}",
+    "{base}/novel/{slug}/chapter-{ch}",
+    "{base}/novel/{slug}/{ch}",
+    "{base}/book/{slug}/chapter-{ch}",
+    "{base}/read/{slug}/chapter-{ch}",
+    "{base}/s/{pascal}/{ch}",
+    "{base}/{slug}-chapter-{ch}",
+    "{base}/chapters/{slug}/{ch}",
+]
+
+# selectors المرشحة للبحث عنها في أي موقع مجهول
+CANDIDATE_SELECTORS = [
+    # IDs شائعة
+    "#chapter-content", "#chaptercontent", "#content", "#readContent",
+    "#chapter-container", "#novel-content", "#reading-content",
+    # classes شائعة
+    ".chapter-content", ".chapter-text", ".chapter-body",
+    ".reading-content", ".read-content", ".novel-content",
+    ".content-text", ".text-content", ".ReadAjax_content",
+    ".Readarea", ".chapter-sentences", ".entry-content",
+    # عناصر دلالية
+    "article.chapter", "article .content", "main article",
+    "div[class*='chapter']", "div[class*='content']",
+    "div[itemprop='articleBody']",
+]
+
+# selectors للعنوان
+TITLE_CANDIDATES = [
+    "h1.chapter-title", "h1.title", ".chapter-title", ".novel-title",
+    "h1", "h2.chapter-name", "title",
+]
+
+
+def _probe_selectors(html: str) -> list[dict]:
+    """
+    يحلل HTML ويُعيد قائمة مرتبة من العناصر المرشحة لاحتواء نص الفصل.
+    كل عنصر: { selector, paragraph_count, char_count, sample }
+    """
+    soup = BeautifulSoup(html, "lxml")
+    for tag in soup.select("script,style,ins,.ads,noscript,nav,header,footer"):
+        tag.decompose()
+
+    results = []
+    seen_ids = set()  # تجنب تكرار نفس العنصر عبر selectors مختلفة
+
+    for sel in CANDIDATE_SELECTORS:
+        try:
+            el = soup.select_one(sel)
+            if not el:
+                continue
+            el_id = id(el)
+            if el_id in seen_ids:
+                continue
+            seen_ids.add(el_id)
+
+            paras = [clean(p.get_text()) for p in el.find_all("p")]
+            paras = [p for p in paras if len(p) > 15 and not is_filtered(p)]
+
+            # fallback: أسطر مباشرة
+            if len(paras) < 3:
+                lines = [clean(l) for l in el.get_text(separator="\n").split("\n")]
+                paras = [l for l in lines if len(l) > 15 and not is_filtered(l)]
+
+            char_count = sum(len(p) for p in paras)
+            if char_count < 200:
+                continue
+
+            results.append({
+                "selector": sel,
+                "paragraph_count": len(paras),
+                "char_count": char_count,
+                "sample": paras[0][:120] if paras else "",
+            })
+        except Exception:
+            continue
+
+    # Fallback: أكبر div/article بالنص
+    for el in soup.select("div, article, section, main"):
+        el_id = id(el)
+        if el_id in seen_ids:
+            continue
+        text = el.get_text()
+        if len(text) < 500:
+            continue
+        paras = [clean(p.get_text()) for p in el.find_all("p")]
+        paras = [p for p in paras if len(p) > 15 and not is_filtered(p)]
+        if len(paras) < 5:
+            continue
+        seen_ids.add(el_id)
+
+        # بناء selector تقريبي من الـ class/id
+        classes = el.get("class", [])
+        el_id_attr = el.get("id", "")
+        if el_id_attr:
+            approx_sel = f"{el.name}#{el_id_attr}"
+        elif classes:
+            approx_sel = f"{el.name}.{classes[0]}"
+        else:
+            approx_sel = el.name
+
+        char_count = sum(len(p) for p in paras)
+        results.append({
+            "selector": approx_sel,
+            "paragraph_count": len(paras),
+            "char_count": char_count,
+            "sample": paras[0][:120] if paras else "",
+            "auto_detected": True,
+        })
+
+    # ترتيب: الأكثر نصاً أولاً
+    results.sort(key=lambda x: x["char_count"], reverse=True)
+    return results[:10]
+
+
+def _build_probe_urls(base_url: str, novel_name: str, chapter_num: int) -> list[dict]:
+    """
+    يبني كل أنماط URL المحتملة للرواية/الفصل.
+    يُعيد: [{ pattern, url }]
+    """
+    base = base_url.rstrip("/")
+    sl = slugify(novel_name)
+    pa = pascal_slug(novel_name)
+    raw = novel_name.replace(" ", "+")
+
+    urls = []
+    for pat in URL_PATTERNS:
+        try:
+            url = pat.format(base=base, slug=sl, pascal=pa, raw=raw, ch=chapter_num)
+            urls.append({"pattern": pat, "url": url})
+        except KeyError:
+            continue
+    return urls
+
+
+async def probe_site(
+    base_url: str,
+    novel_name: str,
+    chapter_num: int,
+    try_all: bool = False,
+) -> dict:
+    """
+    يستكشف موقعاً مجهولاً:
+    1. يجرب أنماط URL حتى يجد صفحة تحتوي محتوى
+    2. يحلل الـ HTML ويكشف أفضل selectors
+    3. يُعيد تقريراً كاملاً + "وصفة" جاهزة للاستخدام في SITES
+
+    try_all=True → يجرب كل الأنماط حتى لو وجد واحداً ناجحاً (للمقارنة)
+    """
+    cache_key = f"probe:{base_url}:{novel_name.lower()}:{chapter_num}"
+    cached = _cache_get(cache_key)
+    if cached:
+        return {**cached, "from_cache": True}
+
+    url_candidates = _build_probe_urls(base_url, novel_name, chapter_num)
+    attempts = []
+    best_result = None
+
+    for candidate in url_candidates:
+        url = candidate["url"]
+        logger.info(f"[Probe] جرب → {url}")
+        html = await fetch_js(url, timeout=20000)
+
+        attempt = {
+            "pattern": candidate["pattern"],
+            "url": url,
+            "ok": False,
+            "http_size": len(html) if html else 0,
+        }
+
+        if not html:
+            attempt["reason"] = "فشل الجلب أو صفحة فارغة"
+            attempts.append(attempt)
+            if not try_all:
+                continue
+        else:
+            sel_results = _probe_selectors(html)
+            title = extract_title(html, TITLE_CANDIDATES)
+
+            if sel_results and sel_results[0]["paragraph_count"] >= 3:
+                attempt["ok"] = True
+                attempt["title"] = title
+                attempt["selectors"] = sel_results
+                attempts.append(attempt)
+
+                if best_result is None:
+                    best_result = attempt
+
+                if not try_all:
+                    break
+            else:
+                attempt["reason"] = "لم يُعثر على محتوى كافٍ"
+                attempt["selectors_found"] = sel_results
+                attempts.append(attempt)
+
+    # ─── بناء "الوصفة" الجاهزة ───────────────────────────────
+    recipe = None
+    if best_result:
+        top_sel = best_result["selectors"][0]["selector"]
+        pattern_used = best_result["pattern"]
+        recipe = {
+            "name": novel_name,
+            "base_url": base_url,
+            "url_pattern": pattern_used,
+            "example_url": best_result["url"],
+            "build_url_template": pattern_used
+                .replace("{base}", base_url.rstrip("/"))
+                .replace("{slug}", "{novel_slug}")
+                .replace("{pascal}", "{novel_pascal}")
+                .replace("{ch}", "{chapter}"),
+            "best_selector": top_sel,
+            "all_selectors": [s["selector"] for s in best_result["selectors"]],
+            "title_selectors": TITLE_CANDIDATES[:4],
+            "note": (
+                "أضف هذه الوصفة إلى SITES في novel.py — "
+                "build_url: lambda name, ch: pattern.format(slug=slugify(name), ch=ch)"
+            ),
+        }
+
+    report = {
+        "base_url": base_url,
+        "novel": novel_name,
+        "chapter": chapter_num,
+        "patterns_tried": len(attempts),
+        "success": best_result is not None,
+        "best_url": best_result["url"] if best_result else None,
+        "best_pattern": best_result["pattern"] if best_result else None,
+        "best_selectors": best_result["selectors"] if best_result else [],
+        "recipe": recipe,
+        "attempts": attempts,
+    }
+
+    if best_result:
+        _cache_set(cache_key, report)
+
+    return report
+
+
 # ─── register ─────────────────────────────────────────────────
 def register(app):
 
@@ -286,7 +532,6 @@ def register(app):
 
             chapter_num = int(chapter_num)
 
-            # ترتيب المواقع: الأفضلية للموقع المطلوب إن وُجد
             sites = SITES[:]
             if preferred_site:
                 sites = sorted(sites, key=lambda s: 0 if s["name"].lower() == preferred_site.lower() else 1)
@@ -310,6 +555,97 @@ def register(app):
             logger.exception("خطأ غير متوقع في /novel")
             return JSONResponse({"error": str(e)[:200]}, status_code=500)
 
+    # ──────────────────────────────────────────────────────────────
+    @app.post("/novel/probe")
+    async def probe_novel_site(request: Request):
+        """
+        يستكشف موقع رواية مجهول ويكشف:
+        - أي نمط URL يعمل للوصول لفصل معين
+        - أي CSS selectors تحتوي على نص الفصل
+        - "وصفة" جاهزة للإضافة إلى SITES
+
+        Body:
+        {
+            "base_url": "https://example-novel-site.com",   ← مطلوب
+            "novel":    "martial peak",                      ← مطلوب
+            "chapter":  1,                                   ← اختياري (افتراضي: 1)
+            "try_all":  false                                ← اختياري: جرب كل الأنماط
+        }
+
+        Response:
+        {
+            "success": true,
+            "best_url": "https://...",
+            "best_pattern": "{base}/{slug}/chapter-{ch}",
+            "best_selectors": [
+                { "selector": ".chapter-content", "paragraph_count": 42, "char_count": 8500, "sample": "..." },
+                ...
+            ],
+            "recipe": {
+                "name": "...",
+                "base_url": "...",
+                "url_pattern": "...",
+                "example_url": "...",
+                "build_url_template": "https://site.com/{novel_slug}/chapter-{chapter}",
+                "best_selector": ".chapter-content",
+                "all_selectors": [...],
+                "title_selectors": [...],
+                "note": "أضف هذه الوصفة إلى SITES في novel.py"
+            },
+            "patterns_tried": 10,
+            "attempts": [
+                { "pattern": "...", "url": "...", "ok": true/false, "reason": "...", "selectors": [...] },
+                ...
+            ],
+            "from_cache": false
+        }
+        """
+        try:
+            body = await request.json()
+            base_url = body.get("base_url", "").strip().rstrip("/")
+            novel_name = body.get("novel", "").strip()
+            chapter_num = int(body.get("chapter", 1))
+            try_all = bool(body.get("try_all", False))
+
+            if not base_url:
+                return JSONResponse({"error": "base_url مطلوب (مثال: https://novelsite.com)"}, status_code=400)
+            if not novel_name:
+                return JSONResponse({"error": "novel مطلوب"}, status_code=400)
+            if chapter_num < 1:
+                return JSONResponse({"error": "chapter يجب أن يكون رقماً موجباً"}, status_code=400)
+
+            # تحقق بسيط من الـ URL
+            if not base_url.startswith("http"):
+                base_url = "https://" + base_url
+
+            report = await probe_site(base_url, novel_name, chapter_num, try_all=try_all)
+            status = 200 if report["success"] else 404
+            return JSONResponse(report, status_code=status)
+
+        except Exception as e:
+            logger.exception("خطأ في /novel/probe")
+            return JSONResponse({"error": str(e)[:200]}, status_code=500)
+
+    # ──────────────────────────────────────────────────────────────
+    @app.get("/novel/probe/patterns")
+    async def list_url_patterns():
+        """
+        يُعيد كل أنماط URL التي يجربها probe مع شرح المتغيرات.
+        مفيد لفهم ما سيتم اختباره قبل استدعاء probe.
+        """
+        return {
+            "variables": {
+                "{base}":   "رابط الموقع الأساسي (مثال: https://novelsite.com)",
+                "{slug}":   "اسم الرواية مُحوَّل لـ slug (مثال: martial-peak)",
+                "{pascal}": "اسم الرواية بـ Pascal-slug (مثال: Martial-Peak)",
+                "{raw}":    "الاسم كما هو مع + بدل المسافات (مثال: martial+peak)",
+                "{ch}":     "رقم الفصل (مثال: 1)",
+            },
+            "patterns": URL_PATTERNS,
+            "total": len(URL_PATTERNS),
+        }
+
+    # ──────────────────────────────────────────────────────────────
     @app.get("/novel/sites")
     async def list_sites():
         """قائمة المواقع المدعومة"""
