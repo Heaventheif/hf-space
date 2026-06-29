@@ -1,17 +1,17 @@
 """
 plugins/novel.py
 endpoint: POST /novel
-يجلب فصول الروايات من freewebnovel.com (ثابت)
+يجلب فصول الروايات من freewebnovel.com فقط
+مع إعادة محاولة تلقائية، تنويع User-Agents، وآلية Fallback .html
 """
 
 import re
 import time
+import asyncio
 import logging
-import unicodedata
 import httpx
-import random
 from typing import Optional
-from fastapi import Request, FastAPI
+from fastapi import Request
 from fastapi.responses import JSONResponse
 from bs4 import BeautifulSoup
 
@@ -37,11 +37,15 @@ def _cache_set(key: str, value):
         del _cache[oldest]
     _cache[key] = {"value": value, "expires": time.time() + CACHE_TTL}
 
-# ─── User Agents ───────────────────────────────────────────────
+# ─── User Agents (متنوعة للإنتاج) ──────────────────────────────
+import random
 UAS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
 ]
 def rua(): return random.choice(UAS)
 
@@ -54,6 +58,7 @@ HEADERS = lambda: {
 
 # ─── slugify ──────────────────────────────────────────────────
 def slugify(name: str) -> str:
+    """تحويل اسم الرواية إلى slug متوافق مع freewebnovel.com"""
     return re.sub(r"^-|-$", "", re.sub(r"[^a-z0-9]+", "-", name.lower().replace("'", "")))
 
 # ─── فلترة النص ───────────────────────────────────────────────
@@ -75,9 +80,11 @@ def is_filtered(t: str) -> bool:
 def clean(t: str) -> str:
     return re.sub(r"\s{2,}", " ", re.sub(r"\.{4,}", "...", t.replace("\u00a0", " "))).strip()
 
-# ─── استخراج المحتوى ─────────────────────────────────────────
+# ─── استخراج محتوى ─────────────────────────────────────────────
 def extract(html: str, selectors: list[str]) -> Optional[list[str]]:
     soup = BeautifulSoup(html, "lxml")
+
+    # إزالة عناصر التشويش
     for tag in soup.select("script,style,ins,.ads,noscript,nav,header,footer"):
         tag.decompose()
 
@@ -100,7 +107,7 @@ def extract(html: str, selectors: list[str]) -> Optional[list[str]]:
         if len(paras) >= 2:
             return paras
 
-    # Fallback
+    # Fallback: أكبر div/article فيه نص
     candidates = []
     for el in soup.select("div, article, section, main"):
         text = el.get_text()
@@ -126,30 +133,48 @@ def extract_title(html: str, selectors: list[str]) -> str:
                 return t
     return ""
 
-# ─── طلب HTTP ──────────────────────────────────────────────────
-async def fetch_page(url: str, timeout: int = 30) -> Optional[str]:
+# ─── طلب HTTP مع إعادة المحاولة التلقائية ────────────────────
+async def fetch_page(url: str, timeout: int = 30, retries: int = 2) -> Optional[str]:
+    """جلب صفحة مع إعادة المحاولة (بحد أقصى 3 محاولات)"""
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-        try:
-            resp = await client.get(url, headers=HEADERS())
-            if resp.status_code != 200:
-                logger.warning(f"HTTP {resp.status_code} من {url}")
-                return None
-            if len(resp.text) < 500:
-                return None
-            lower = resp.text[:3000].lower()
-            if "just a moment" in lower or "cloudflare" in lower:
-                logger.warning(f"حماية Cloudflare على {url}")
-                return None
-            return resp.text
-        except Exception as e:
-            logger.warning(f"فشل جلب {url}: {e}")
-            return None
+        for attempt in range(retries + 1):
+            try:
+                resp = await client.get(url, headers=HEADERS())
+                if resp.status_code == 200 and len(resp.text) > 500:
+                    # فحص سريع للحماية
+                    lower = resp.text[:3000].lower()
+                    if "just a moment" in lower or "cloudflare" in lower:
+                        logger.warning(f"حماية Cloudflare على {url}")
+                        break  # لا فائدة من إعادة المحاولة
+                    return resp.text
+            except httpx.TimeoutException:
+                if attempt == retries:
+                    logger.warning(f"Timeout بعد {retries} محاولات: {url}")
+            except Exception as e:
+                if attempt == retries:
+                    logger.warning(f"فشل جلب {url} بعد {retries} محاولات: {e}")
+            await asyncio.sleep(1)  # انتظر ثانية قبل إعادة المحاولة
+        return None
 
-# ─── الموقع الوحيد ─────────────────────────────────────────────
+# ─── الموقع الوحيد (مع selectors موسعة) ──────────────────────
 SITE = {
     "name": "Freewebnovel",
+    # المسار الصحيح بدون /novel/
     "build_url": lambda slug, ch: f"https://freewebnovel.com/{slug}/chapter-{ch}",
-    "selectors": ["#article", "div#article"],
+    # قائمة selectors موسعة
+    "selectors": [
+        "#chapter-content",
+        ".chapter-content",
+        "#content",
+        ".content",
+        "#reading-content",
+        ".reading-content",
+        "#article",
+        "div#article",
+        "div[class*='chapter']",
+        "article",
+        "main"
+    ],
     "title_sel": ["h1", "title"],
 }
 
@@ -163,10 +188,18 @@ async def fetch_chapter(novel_name: str, chapter_num: int) -> dict:
     if not slug:
         raise ValueError("اسم الرواية غير صالح بعد التحويل إلى slug")
 
+    # المحاولة الأولى: الرابط النظيف (بدون .html)
     url = SITE["build_url"](slug, chapter_num)
     html = await fetch_page(url)
+
+    # المحاولة الثانية: إضافة .html (للمواقع القديمة في الموقع)
     if not html:
-        raise ValueError(f"فشل جلب الصفحة: {url}")
+        logger.info(f"فشل الرابط النظيف، جرب .html: {url}.html")
+        url = f"{SITE['build_url'](slug, chapter_num)}.html"
+        html = await fetch_page(url)
+
+    if not html:
+        raise ValueError(f"فشل جلب الصفحة بكلا النمطين: {SITE['build_url'](slug, chapter_num)}")
 
     paragraphs = extract(html, SITE["selectors"])
     if not paragraphs:
@@ -186,7 +219,8 @@ async def fetch_chapter(novel_name: str, chapter_num: int) -> dict:
     return result
 
 # ─── تسجيل الـ endpoints ──────────────────────────────────────
-def register(app: FastAPI):
+def register(app):
+
     @app.post("/novel")
     async def get_chapter(request: Request):
         try:
