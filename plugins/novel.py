@@ -10,6 +10,8 @@ import re
 import time
 import asyncio
 import logging
+import difflib
+import unicodedata
 from typing import Optional
 from fastapi import Request
 from fastapi.responses import JSONResponse
@@ -181,7 +183,39 @@ SITES = [
 ]
 
 # ─── WtrLab: resolve ID ────────────────────────────────────────
-async def resolve_wtrlab_id(novel_name: str) -> Optional[str]:
+class NeedsSelectionError(Exception):
+    """
+    تُرفع عندما لا يكون هناك تطابق واضح وحاسم لاسم الرواية.
+    بدل تخمين النتيجة الأولى (الخطأ الأصلي) أو حجب الـ request بـ input()
+    (غير ممكن أصلاً داخل endpoint في خادم HTTP)، نُرجع للمستدعي قائمة
+    مرشحين ليختار منها — وهو ما يقوم به الـ frontend (الموقع/التطبيق)
+    بدل الـ Terminal.
+    """
+    def __init__(self, candidates: list[dict]):
+        self.candidates = candidates
+        super().__init__(f"اختيار مطلوب بين {len(candidates)} نتيجة محتملة")
+
+
+def _normalize_title(t: str) -> str:
+    """
+    توحيد العنوان قبل المقارنة: إزالة الفواصل/الرموز، توحيد الحالة،
+    إزالة المسافات الزائدة، وإزالة علامات التشكيل (NFKD) — حتى لا يفشل
+    التطابق التام لأسباب سطحية (علامات ترقيم، مسافة مزدوجة...).
+    """
+    t = unicodedata.normalize("NFKD", t)
+    t = re.sub(r"[^\w\s]", "", t.lower())
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+async def resolve_wtrlab_id(novel_name: str):
+    """
+    يُرجع:
+      - str  → ID رواية واحدة بثقة كافية (تطابق تام أو شبه تام وواضح)
+      - dict → {"ambiguous": True, "candidates": [...]} عندما تتقارب النتائج
+               ولا يمكن الحسم تلقائياً بأمان (فانفيك / أسماء متشابهة)
+      - None → لا توجد أي نتيجة من الأساس
+    """
     key = f"wtrlab:id:{novel_name.lower()}"
     cached = _cache_get(key)
     if cached:
@@ -194,44 +228,76 @@ async def resolve_wtrlab_id(novel_name: str) -> Optional[str]:
 
     soup = BeautifulSoup(html, "lxml")
     pat = re.compile(r"/en/novel/(\d+)/")
+    target = _normalize_title(novel_name)
 
-    name_words = [w.lower() for w in novel_name.split() if len(w) > 2]
-
-    best_id = None
-    best_score = 0
-
+    candidates = []
+    seen_ids = set()
     for a in soup.select("a[href*='/en/novel/']"):
         href = a.get("href", "")
         m = pat.search(href)
         if not m:
             continue
-        link_text = (a.get_text() + " " + href).lower()
-        score = sum(1 for w in name_words if w in link_text)
-        if score > best_score:
-            best_score = score
-            best_id = m.group(1)
-        if score == len(name_words):
-            break
+        novel_id = m.group(1)
+        if novel_id in seen_ids:
+            continue
+        title = a.get_text(strip=True)
+        if not title:
+            continue
+        seen_ids.add(novel_id)
 
-    if best_id and best_score >= max(1, len(name_words) // 2):
-        _cache_set(key, best_id)
-        logger.info(f"[WtrLab] ID لـ '{novel_name}' = {best_id} (score={best_score}/{len(name_words)})")
-        return best_id
+        norm_title = _normalize_title(title)
+        score = 1.0 if norm_title == target else difflib.SequenceMatcher(None, norm_title, target).ratio()
+        candidates.append({"id": novel_id, "title": title, "score": round(score, 3)})
 
-    logger.warning(f"[WtrLab] لم يُعثر على تطابق لـ '{novel_name}' (أفضل score={best_score})")
-    return None
+    if not candidates:
+        logger.warning(f"[WtrLab] لم يُعثر على أي نتيجة لـ '{novel_name}'")
+        return None
+
+    candidates.sort(key=lambda c: c["score"], reverse=True)
+    best = candidates[0]
+    second_score = candidates[1]["score"] if len(candidates) > 1 else 0.0
+
+    # 1) تطابق تام (بعد التوحيد) → ثقة كاملة، نعتمد فوراً
+    if best["score"] == 1.0:
+        _cache_set(key, best["id"])
+        logger.info(f"[WtrLab] تطابق تام لـ '{novel_name}' → ID={best['id']}")
+        return best["id"]
+
+    # 2) تشابه قوي جداً + فارق واضح عن أقرب منافس → اعتماد آمن
+    #    (يمنع اختيار فانفيك بالخطأ حتى لو كان الاسم قريباً جداً)
+    if best["score"] >= 0.85 and (best["score"] - second_score) >= 0.12:
+        _cache_set(key, best["id"])
+        logger.info(
+            f"[WtrLab] تشابه قوي وحاسم لـ '{novel_name}' → '{best['title']}' "
+            f"(score={best['score']}, الفرق عن الثاني={round(best['score']-second_score,3)})"
+        )
+        return best["id"]
+
+    # 3) حالة غامضة (نتائج متقاربة أو ضعيفة) → لا نخمن، نُرجع المرشحين
+    logger.warning(
+        f"[WtrLab] نتائج غامضة لـ '{novel_name}' — أفضل score={best['score']}, "
+        f"الثاني={second_score}. سيتم طلب اختيار يدوي."
+    )
+    return {"ambiguous": True, "candidates": candidates[:5]}
 
 # ─── جلب فصل من موقع ──────────────────────────────────────────
-async def fetch_from_site(site: dict, novel_name: str, chapter_num: int) -> dict:
+async def fetch_from_site(site: dict, novel_name: str, chapter_num: int, novel_id_override: str = None) -> dict:
     key = f"{site['name']}:{novel_name.lower()}:{chapter_num}"
     cached = _cache_get(key)
     if cached:
         return cached
 
     if site.get("needs_id"):
-        novel_id = await resolve_wtrlab_id(novel_name)
-        if not novel_id:
-            raise ValueError(f"WtrLab: لم يُعثر على ID الرواية '{novel_name}'")
+        if novel_id_override:
+            # المستخدم/الواجهة الأمامية اختار الرواية مسبقاً (بعد رؤية المرشحين) — تخطّي البحث كلياً
+            novel_id = novel_id_override
+        else:
+            resolved = await resolve_wtrlab_id(novel_name)
+            if resolved is None:
+                raise ValueError(f"WtrLab: لم يُعثر على ID الرواية '{novel_name}'")
+            if isinstance(resolved, dict) and resolved.get("ambiguous"):
+                raise NeedsSelectionError(resolved["candidates"])
+            novel_id = resolved
         url = site["build_url"](novel_id, chapter_num)
     else:
         url = site["build_url"](novel_name, chapter_num)
@@ -524,6 +590,7 @@ def register(app):
             novel_name = body.get("novel", "").strip()
             chapter_num = body.get("chapter")
             preferred_site = body.get("site", "").strip()
+            novel_id = str(body.get("novel_id", "")).strip() or None
 
             if not novel_name:
                 return JSONResponse({"error": "novel مطلوب"}, status_code=400)
@@ -539,8 +606,20 @@ def register(app):
             errors = []
             for site in sites:
                 try:
-                    result = await fetch_from_site(site, novel_name, chapter_num)
+                    result = await fetch_from_site(
+                        site, novel_name, chapter_num,
+                        novel_id_override=novel_id if site.get("needs_id") else None,
+                    )
                     return JSONResponse(result)
+                except NeedsSelectionError as e:
+                    # لا نخمّن ولا نعلّق الطلب بانتظار إدخال — نُرجع المرشحين فوراً
+                    # ليعرضهم الـ frontend (موقع/تطبيق) ويُعيد الطلب مع novel_id الصحيح
+                    return JSONResponse({
+                        "need_selection": True,
+                        "message": f"وُجدت عدة نتائج متشابهة لـ '{novel_name}' على {site['name']}، اختر الصحيحة وأعد الطلب مع novel_id",
+                        "site": site["name"],
+                        "candidates": e.candidates,
+                    }, status_code=200)
                 except Exception as e:
                     err = f"{site['name']}: {str(e)[:80]}"
                     errors.append(err)
