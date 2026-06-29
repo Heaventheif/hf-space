@@ -1,8 +1,8 @@
 """
 plugins/novel.py
 endpoint: POST /novel
-يجلب فصول الروايات من freewebnovel.com فقط
-مع إعادة محاولة تلقائية، تنويع User-Agents، وآلية Fallback .html
+يجلب فصول الروايات من freewebnovel.com
+يحاول أولاً طلب HTTP عادي، ثم Playwright كخيار احتياطي
 """
 
 import re
@@ -37,7 +37,7 @@ def _cache_set(key: str, value):
         del _cache[oldest]
     _cache[key] = {"value": value, "expires": time.time() + CACHE_TTL}
 
-# ─── User Agents (متنوعة للإنتاج) ──────────────────────────────
+# ─── User Agents ──────────────────────────────────────────────
 import random
 UAS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
@@ -45,7 +45,6 @@ UAS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
 ]
 def rua(): return random.choice(UAS)
 
@@ -58,7 +57,6 @@ HEADERS = lambda: {
 
 # ─── slugify ──────────────────────────────────────────────────
 def slugify(name: str) -> str:
-    """تحويل اسم الرواية إلى slug متوافق مع freewebnovel.com"""
     return re.sub(r"^-|-$", "", re.sub(r"[^a-z0-9]+", "-", name.lower().replace("'", "")))
 
 # ─── فلترة النص ───────────────────────────────────────────────
@@ -84,7 +82,6 @@ def clean(t: str) -> str:
 def extract(html: str, selectors: list[str]) -> Optional[list[str]]:
     soup = BeautifulSoup(html, "lxml")
 
-    # إزالة عناصر التشويش
     for tag in soup.select("script,style,ins,.ads,noscript,nav,header,footer"):
         tag.decompose()
 
@@ -133,35 +130,57 @@ def extract_title(html: str, selectors: list[str]) -> str:
                 return t
     return ""
 
-# ─── طلب HTTP مع إعادة المحاولة التلقائية ────────────────────
-async def fetch_page(url: str, timeout: int = 30, retries: int = 2) -> Optional[str]:
-    """جلب صفحة مع إعادة المحاولة (بحد أقصى 3 محاولات)"""
+# ─── طلب HTTP عادي ────────────────────────────────────────────
+async def fetch_page_http(url: str, timeout: int = 30, retries: int = 2) -> Optional[str]:
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
         for attempt in range(retries + 1):
             try:
                 resp = await client.get(url, headers=HEADERS())
                 if resp.status_code == 200 and len(resp.text) > 500:
-                    # فحص سريع للحماية
                     lower = resp.text[:3000].lower()
                     if "just a moment" in lower or "cloudflare" in lower:
-                        logger.warning(f"حماية Cloudflare على {url}")
-                        break  # لا فائدة من إعادة المحاولة
+                        logger.warning(f"Cloudflare على {url}")
+                        break
                     return resp.text
             except httpx.TimeoutException:
                 if attempt == retries:
                     logger.warning(f"Timeout بعد {retries} محاولات: {url}")
             except Exception as e:
                 if attempt == retries:
-                    logger.warning(f"فشل جلب {url} بعد {retries} محاولات: {e}")
-            await asyncio.sleep(1)  # انتظر ثانية قبل إعادة المحاولة
+                    logger.warning(f"فشل جلب {url}: {e}")
+            await asyncio.sleep(1)
         return None
 
-# ─── الموقع الوحيد (مع selectors موسعة) ──────────────────────
+# ─── طلب باستخدام Playwright ──────────────────────────────────
+async def fetch_page_playwright(url: str, wait_sel: str = None, timeout: int = 30000) -> Optional[str]:
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        logger.warning("Playwright غير مثبت، تخطي هذه المحاولة")
+        return None
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+        )
+        try:
+            page = await browser.new_page(user_agent=rua())
+            await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+            if wait_sel:
+                try:
+                    await page.wait_for_selector(wait_sel, timeout=10000)
+                except Exception:
+                    pass
+            html = await page.content()
+            return html if len(html) > 500 else None
+        finally:
+            await browser.close()
+
+# ─── الموقع ────────────────────────────────────────────────────
 SITE = {
     "name": "Freewebnovel",
-    # المسار الصحيح بدون /novel/
     "build_url": lambda slug, ch: f"https://freewebnovel.com/{slug}/chapter-{ch}",
-    # قائمة selectors موسعة
     "selectors": [
         "#chapter-content",
         ".chapter-content",
@@ -176,6 +195,8 @@ SITE = {
         "main"
     ],
     "title_sel": ["h1", "title"],
+    # محدد يُستخدم لانتظار تحميل المحتوى في Playwright
+    "wait_selector": "#chapter-content, .chapter-content, article, main",
 }
 
 async def fetch_chapter(novel_name: str, chapter_num: int) -> dict:
@@ -186,23 +207,33 @@ async def fetch_chapter(novel_name: str, chapter_num: int) -> dict:
 
     slug = slugify(novel_name)
     if not slug:
-        raise ValueError("اسم الرواية غير صالح بعد التحويل إلى slug")
+        raise ValueError("اسم الرواية غير صالح")
 
-    # المحاولة الأولى: الرابط النظيف (بدون .html)
     url = SITE["build_url"](slug, chapter_num)
-    html = await fetch_page(url)
+    html = None
 
-    # المحاولة الثانية: إضافة .html (للمواقع القديمة في الموقع)
+    # 1. المحاولة الأولى: HTTP عادي (بدون .html)
+    logger.info(f"[HTTP] جلب {url}")
+    html = await fetch_page_http(url)
+
+    # 2. إذا فشل، جرب بإضافة .html
     if not html:
-        logger.info(f"فشل الرابط النظيف، جرب .html: {url}.html")
-        url = f"{SITE['build_url'](slug, chapter_num)}.html"
-        html = await fetch_page(url)
+        url_html = f"{url}.html"
+        logger.info(f"[HTTP] جرب .html: {url_html}")
+        html = await fetch_page_http(url_html)
+
+    # 3. إذا فشل HTTP، جرب Playwright (قد يكون محتوى ديناميكي)
+    if not html:
+        logger.info(f"[Playwright] جلب {url}")
+        html = await fetch_page_playwright(url, wait_sel=SITE.get("wait_selector"))
 
     if not html:
-        raise ValueError(f"فشل جلب الصفحة بكلا النمطين: {SITE['build_url'](slug, chapter_num)}")
+        raise ValueError(f"فشل جلب الصفحة بكل الطرق: {url}")
 
     paragraphs = extract(html, SITE["selectors"])
     if not paragraphs:
+        # تخزين جزء من HTML للتشخيص
+        logger.warning(f"HTML المقتطع (أول 500 حرف): {html[:500]}")
         raise ValueError("لم يُعثر على محتوى (تحقق من selectors)")
 
     title = extract_title(html, SITE["title_sel"]) or novel_name
@@ -218,7 +249,7 @@ async def fetch_chapter(novel_name: str, chapter_num: int) -> dict:
     _cache_set(key, result)
     return result
 
-# ─── تسجيل الـ endpoints ──────────────────────────────────────
+# ─── endpoints ──────────────────────────────────────────────────
 def register(app):
 
     @app.post("/novel")
@@ -231,17 +262,17 @@ def register(app):
             if not novel_name:
                 return JSONResponse({"error": "novel مطلوب"}, status_code=400)
             if not chapter_num or int(str(chapter_num)) < 1:
-                return JSONResponse({"error": "chapter يجب أن يكون رقماً موجباً"}, status_code=400)
+                return JSONResponse({"error": "chapter موجب"}, status_code=400)
             chapter_num = int(chapter_num)
 
             result = await fetch_chapter(novel_name, chapter_num)
             return JSONResponse(result)
 
         except ValueError as e:
-            logger.warning(f"خطأ في /novel: {e}")
+            logger.warning(f"خطأ: {e}")
             return JSONResponse({"error": str(e)}, status_code=404)
         except Exception as e:
-            logger.exception("خطأ غير متوقع في /novel")
+            logger.exception("خطأ غير متوقع")
             return JSONResponse({"error": str(e)[:200]}, status_code=500)
 
     @app.get("/novel/sites")
