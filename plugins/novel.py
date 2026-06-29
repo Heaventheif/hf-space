@@ -76,22 +76,45 @@ def clean(t: str) -> str:
 # ─── استخراج محتوى ─────────────────────────────────────────────
 def extract(html: str, selectors: list[str]) -> Optional[list[str]]:
     soup = BeautifulSoup(html, "lxml")
+
+    # إزالة عناصر التشويش أولاً
+    for tag in soup.select("script,style,ins,.ads,noscript,nav,header,footer"):
+        tag.decompose()
+
     container = None
     for sel in selectors:
-        el = soup.select_one(sel)
-        if el:
-            container = el
-            break
-    if not container:
-        return None
-    for tag in container.select("script,style,ins,.ads,noscript"):
-        tag.decompose()
-    paras = [clean(p.get_text()) for p in container.find_all("p")]
-    paras = [p for p in paras if len(p) > 15 and not is_filtered(p)]
-    if len(paras) < 3:
-        raw = [clean(l) for l in container.get_text(separator="\n").split("\n")]
-        paras = [p for p in raw if len(p) > 15 and not is_filtered(p)]
-    return paras if len(paras) >= 2 else None
+        try:
+            el = soup.select_one(sel)
+            if el and len(el.get_text()) > 200:
+                container = el
+                break
+        except Exception:
+            continue
+
+    if container:
+        paras = [clean(p.get_text()) for p in container.find_all("p")]
+        paras = [p for p in paras if len(p) > 15 and not is_filtered(p)]
+        if len(paras) < 3:
+            raw = [clean(l) for l in container.get_text(separator="\n").split("\n")]
+            paras = [p for p in raw if len(p) > 15 and not is_filtered(p)]
+        if len(paras) >= 2:
+            return paras
+
+    # Fallback: أكبر div/article فيه نص (إذا فشلت كل الـ selectors)
+    candidates = []
+    for el in soup.select("div, article, section, main"):
+        text = el.get_text()
+        if len(text) > 500:
+            candidates.append((len(text), el))
+    candidates.sort(reverse=True)
+
+    for _, el in candidates[:3]:
+        paras = [clean(p.get_text()) for p in el.find_all("p")]
+        paras = [p for p in paras if len(p) > 15 and not is_filtered(p)]
+        if len(paras) >= 5:
+            return paras
+
+    return None
 
 def extract_title(html: str, selectors: list[str]) -> str:
     soup = BeautifulSoup(html, "lxml")
@@ -144,8 +167,16 @@ SITES = [
         "search_url": lambda name: f"https://wtr-lab.com/en/novel-list?search={name.replace(' ', '+')}",
         "id_pattern": re.compile(r"/en/novel/(\d+)/"),
         "build_url": lambda novel_id, ch: f"https://wtr-lab.com/en/novel/{novel_id}/chapter-{ch}",
-        "wait_sel": ".chapter-content, div[class*='chapter']",
-        "selectors": [".chapter-content", "div[class*='chapter']", "article", "main .content"],
+        "wait_sel": ".chapter-sentences, .chapter-content, div[class*='chapter']",
+        "selectors": [
+            ".chapter-sentences",      # WtrLab الحديث
+            ".chapter-content",
+            "div[class*='sentence']",
+            "div[class*='chapter-text']",
+            "div[class*='chapter']",
+            "article .content",
+            "main article",
+        ],
         "title_sel": [".novel-title", "h1", "title"],
     },
 ]
@@ -164,13 +195,34 @@ async def resolve_wtrlab_id(novel_name: str) -> Optional[str]:
 
     soup = BeautifulSoup(html, "lxml")
     pat = re.compile(r"/en/novel/(\d+)/")
+
+    # كلمات الاسم للمطابقة (تجاهل الكلمات القصيرة)
+    name_words = [w.lower() for w in novel_name.split() if len(w) > 2]
+
+    best_id = None
+    best_score = 0
+
     for a in soup.select("a[href*='/en/novel/']"):
-        m = pat.search(a.get("href", ""))
-        if m:
-            novel_id = m.group(1)
-            _cache_set(key, novel_id)
-            logger.info(f"[WtrLab] ID لـ '{novel_name}' = {novel_id}")
-            return novel_id
+        href = a.get("href", "")
+        m = pat.search(href)
+        if not m:
+            continue
+        # نص الرابط + الـ href معاً للمطابقة
+        link_text = (a.get_text() + " " + href).lower()
+        score = sum(1 for w in name_words if w in link_text)
+        if score > best_score:
+            best_score = score
+            best_id = m.group(1)
+        if score == len(name_words):
+            break
+
+    # اقبل فقط إذا طابق نصف الكلمات على الأقل
+    if best_id and best_score >= max(1, len(name_words) // 2):
+        _cache_set(key, best_id)
+        logger.info(f"[WtrLab] ID لـ '{novel_name}' = {best_id} (score={best_score}/{len(name_words)})")
+        return best_id
+
+    logger.warning(f"[WtrLab] لم يُعثر على تطابق لـ '{novel_name}' (أفضل score={best_score})")
     return None
 
 # ─── جلب فصل من موقع ──────────────────────────────────────────
