@@ -2,7 +2,7 @@
 plugins/novel.py
 endpoint: POST /novel
 يجلب فصول الروايات من freewebnovel.com
-يحاول أولاً طلب HTTP عادي، ثم Playwright كخيار احتياطي
+يحاول HTTP أولاً، ثم Playwright مع networkidle
 """
 
 import re
@@ -64,6 +64,7 @@ FILTER_WORDS = [
     "advertisement", "report chapter", "next chapter", "prev chapter",
     "table of contents", "access denied", "just a moment", "cloudflare",
     "enable javascript", "read more at",
+    "cookie", "privacy", "terms of service", "subscribe",
 ]
 STOLEN = [
     re.compile(r"stol(en|e)\s+(content|chapter)", re.I),
@@ -73,19 +74,23 @@ STOLEN = [
 
 def is_filtered(t: str) -> bool:
     lo = t.lower()
+    if len(t) < 15:
+        return True
     return any(w in lo for w in FILTER_WORDS) or any(p.search(t) for p in STOLEN)
 
 def clean(t: str) -> str:
     return re.sub(r"\s{2,}", " ", re.sub(r"\.{4,}", "...", t.replace("\u00a0", " "))).strip()
 
-# ─── استخراج محتوى ─────────────────────────────────────────────
+# ─── استخراج محتوى محسّن ──────────────────────────────────────
 def extract(html: str, selectors: list[str]) -> Optional[list[str]]:
     soup = BeautifulSoup(html, "lxml")
 
-    for tag in soup.select("script,style,ins,.ads,noscript,nav,header,footer"):
+    # إزالة العناصر المزعجة
+    for tag in soup.select("script,style,ins,.ads,noscript,nav,header,footer,.advertisement"):
         tag.decompose()
 
     container = None
+    # 1. محاولة المحددات المحددة
     for sel in selectors:
         try:
             el = soup.select_one(sel)
@@ -95,30 +100,30 @@ def extract(html: str, selectors: list[str]) -> Optional[list[str]]:
         except Exception:
             continue
 
-    if container:
-        paras = [clean(p.get_text()) for p in container.find_all("p")]
-        paras = [p for p in paras if len(p) > 15 and not is_filtered(p)]
-        if len(paras) < 3:
-            raw = [clean(l) for l in container.get_text(separator="\n").split("\n")]
-            paras = [p for p in raw if len(p) > 15 and not is_filtered(p)]
-        if len(paras) >= 2:
-            return paras
+    # 2. إذا لم نجد، استخدم body
+    if not container:
+        logger.info("لم يعثر على محدد، استخدام body كامل")
+        container = soup.body
 
-    # Fallback: أكبر div/article فيه نص
-    candidates = []
-    for el in soup.select("div, article, section, main"):
-        text = el.get_text()
-        if len(text) > 500:
-            candidates.append((len(text), el))
-    candidates.sort(reverse=True)
+    if not container:
+        return None
 
-    for _, el in candidates[:3]:
-        paras = [clean(p.get_text()) for p in el.find_all("p")]
-        paras = [p for p in paras if len(p) > 15 and not is_filtered(p)]
-        if len(paras) >= 5:
-            return paras
+    # استخراج الفقرات
+    paras = [clean(p.get_text()) for p in container.find_all("p")]
+    paras = [p for p in paras if len(p) > 15 and not is_filtered(p)]
 
-    return None
+    # إذا كانت الفقرات قليلة، جرب تقسيم النص على أسطر
+    if len(paras) < 3:
+        raw = [clean(l) for l in container.get_text(separator="\n").split("\n")]
+        paras = [p for p in raw if len(p) > 15 and not is_filtered(p)]
+
+    # إذا لم توجد فقرات كافية، قسّم النص إلى جمل
+    if len(paras) < 2:
+        text = container.get_text()
+        sentences = re.split(r'[.!?]\s+', text)
+        paras = [clean(s) for s in sentences if len(s) > 20 and not is_filtered(s)]
+
+    return paras if len(paras) >= 2 else None
 
 def extract_title(html: str, selectors: list[str]) -> str:
     soup = BeautifulSoup(html, "lxml")
@@ -128,6 +133,11 @@ def extract_title(html: str, selectors: list[str]) -> str:
             t = re.split(r"[–\-|]", el.get_text())[0].strip()
             if len(t) > 2:
                 return t
+    title_tag = soup.find("title")
+    if title_tag:
+        t = title_tag.get_text().strip()
+        if len(t) > 2:
+            return t.split(" - ")[0]
     return ""
 
 # ─── طلب HTTP عادي ────────────────────────────────────────────
@@ -151,12 +161,12 @@ async def fetch_page_http(url: str, timeout: int = 30, retries: int = 2) -> Opti
             await asyncio.sleep(1)
         return None
 
-# ─── طلب باستخدام Playwright ──────────────────────────────────
-async def fetch_page_playwright(url: str, wait_sel: str = None, timeout: int = 30000) -> Optional[str]:
+# ─── طلب باستخدام Playwright (مع networkidle) ──────────────────
+async def fetch_page_playwright(url: str, wait_sel: str = None, timeout: int = 45000) -> Optional[str]:
     try:
         from playwright.async_api import async_playwright
     except ImportError:
-        logger.warning("Playwright غير مثبت، تخطي هذه المحاولة")
+        logger.warning("Playwright غير مثبت")
         return None
 
     async with async_playwright() as p:
@@ -166,12 +176,16 @@ async def fetch_page_playwright(url: str, wait_sel: str = None, timeout: int = 3
         )
         try:
             page = await browser.new_page(user_agent=rua())
-            await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+            # استخدام networkidle لضمان تحميل كل المحتوى
+            await page.goto(url, wait_until="networkidle", timeout=timeout)
+            # انتظار إضافي للمحتوى الديناميكي
             if wait_sel:
                 try:
-                    await page.wait_for_selector(wait_sel, timeout=10000)
+                    await page.wait_for_selector(wait_sel, timeout=15000)
                 except Exception:
                     pass
+            # تأخير إضافي صغير
+            await asyncio.sleep(2)
             html = await page.content()
             return html if len(html) > 500 else None
         finally:
@@ -192,11 +206,11 @@ SITE = {
         "div#article",
         "div[class*='chapter']",
         "article",
-        "main"
+        "main",
+        "body",  # المحاولة الأخيرة
     ],
-    "title_sel": ["h1", "title"],
-    # محدد يُستخدم لانتظار تحميل المحتوى في Playwright
-    "wait_selector": "#chapter-content, .chapter-content, article, main",
+    "title_sel": ["h1", ".novel-title", ".truyen-title", "title"],
+    "wait_selector": "#chapter-content, .chapter-content, article, main, body",
 }
 
 async def fetch_chapter(novel_name: str, chapter_num: int) -> dict:
@@ -212,17 +226,17 @@ async def fetch_chapter(novel_name: str, chapter_num: int) -> dict:
     url = SITE["build_url"](slug, chapter_num)
     html = None
 
-    # 1. المحاولة الأولى: HTTP عادي (بدون .html)
+    # 1. HTTP عادي
     logger.info(f"[HTTP] جلب {url}")
     html = await fetch_page_http(url)
 
-    # 2. إذا فشل، جرب بإضافة .html
+    # 2. HTTP مع .html
     if not html:
         url_html = f"{url}.html"
         logger.info(f"[HTTP] جرب .html: {url_html}")
         html = await fetch_page_http(url_html)
 
-    # 3. إذا فشل HTTP، جرب Playwright (قد يكون محتوى ديناميكي)
+    # 3. Playwright مع networkidle
     if not html:
         logger.info(f"[Playwright] جلب {url}")
         html = await fetch_page_playwright(url, wait_sel=SITE.get("wait_selector"))
@@ -232,9 +246,9 @@ async def fetch_chapter(novel_name: str, chapter_num: int) -> dict:
 
     paragraphs = extract(html, SITE["selectors"])
     if not paragraphs:
-        # تخزين جزء من HTML للتشخيص
-        logger.warning(f"HTML المقتطع (أول 500 حرف): {html[:500]}")
-        raise ValueError("لم يُعثر على محتوى (تحقق من selectors)")
+        sample = html[:1000].replace("\n", " ")
+        logger.warning(f"عينة HTML: {sample}")
+        raise ValueError("لم يُعثر على محتوى (تحقق من بنية الصفحة)")
 
     title = extract_title(html, SITE["title_sel"]) or novel_name
 
