@@ -2,7 +2,6 @@
 plugins/novel.py
 endpoint: POST /novel
 يجلب فصول الروايات من freewebnovel.com
-يحاول HTTP أولاً، ثم Playwright مع networkidle
 """
 
 import re
@@ -100,9 +99,17 @@ def extract(html: str, selectors: list[str]) -> Optional[list[str]]:
         except Exception:
             continue
 
-    # 2. إذا لم نجد، استخدم body
+    # 2. إذا لم نجد، استخدم .m-read
     if not container:
-        logger.info("لم يعثر على محدد، استخدام body كامل")
+        container = soup.select_one(".m-read")
+        if container and len(container.get_text()) > 200:
+            logger.info("استخدم .m-read كحاوية")
+        else:
+            container = None
+
+    # 3. أخيراً، استخدم body
+    if not container:
+        logger.info("استخدم body كحاوية أخيرة")
         container = soup.body
 
     if not container:
@@ -133,6 +140,12 @@ def extract_title(html: str, selectors: list[str]) -> str:
             t = re.split(r"[–\-|]", el.get_text())[0].strip()
             if len(t) > 2:
                 return t
+    # محاولة من .tit أو .chapter
+    tit = soup.select_one(".tit")
+    if tit:
+        t = tit.get_text().strip()
+        if len(t) > 2:
+            return t
     title_tag = soup.find("title")
     if title_tag:
         t = title_tag.get_text().strip()
@@ -161,7 +174,7 @@ async def fetch_page_http(url: str, timeout: int = 30, retries: int = 2) -> Opti
             await asyncio.sleep(1)
         return None
 
-# ─── طلب باستخدام Playwright (مع networkidle) ──────────────────
+# ─── طلب باستخدام Playwright ──────────────────────────────────
 async def fetch_page_playwright(url: str, wait_sel: str = None, timeout: int = 45000) -> Optional[str]:
     try:
         from playwright.async_api import async_playwright
@@ -176,25 +189,23 @@ async def fetch_page_playwright(url: str, wait_sel: str = None, timeout: int = 4
         )
         try:
             page = await browser.new_page(user_agent=rua())
-            # استخدام networkidle لضمان تحميل كل المحتوى
             await page.goto(url, wait_until="networkidle", timeout=timeout)
-            # انتظار إضافي للمحتوى الديناميكي
             if wait_sel:
                 try:
                     await page.wait_for_selector(wait_sel, timeout=15000)
                 except Exception:
                     pass
-            # تأخير إضافي صغير
             await asyncio.sleep(2)
             html = await page.content()
             return html if len(html) > 500 else None
         finally:
             await browser.close()
 
-# ─── الموقع ────────────────────────────────────────────────────
+# ─── الموقع (مع المسار الصحيح) ─────────────────────────────────
 SITE = {
     "name": "Freewebnovel",
-    "build_url": lambda slug, ch: f"https://freewebnovel.com/{slug}/chapter-{ch}",
+    # ✅ الرابط الصحيح مع /novel/
+    "build_url": lambda slug, ch: f"https://freewebnovel.com/novel/{slug}/chapter-{ch}",
     "selectors": [
         "#chapter-content",
         ".chapter-content",
@@ -205,12 +216,15 @@ SITE = {
         "#article",
         "div#article",
         "div[class*='chapter']",
+        ".txt",
+        "div.txt",
         "article",
         "main",
-        "body",  # المحاولة الأخيرة
+        ".m-read",
+        "body",
     ],
-    "title_sel": ["h1", ".novel-title", ".truyen-title", "title"],
-    "wait_selector": "#chapter-content, .chapter-content, article, main, body",
+    "title_sel": ["h1.tit", ".tit", "h1", ".chapter", "title"],
+    "wait_selector": ".m-read, #chapter-content, .chapter-content, article, main, body",
 }
 
 async def fetch_chapter(novel_name: str, chapter_num: int) -> dict:
@@ -236,7 +250,7 @@ async def fetch_chapter(novel_name: str, chapter_num: int) -> dict:
         logger.info(f"[HTTP] جرب .html: {url_html}")
         html = await fetch_page_http(url_html)
 
-    # 3. Playwright مع networkidle
+    # 3. Playwright
     if not html:
         logger.info(f"[Playwright] جلب {url}")
         html = await fetch_page_playwright(url, wait_sel=SITE.get("wait_selector"))
