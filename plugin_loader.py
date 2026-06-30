@@ -16,12 +16,54 @@ import importlib
 import importlib.util
 import logging
 
+from fastapi import Request
+from fastapi.responses import JSONResponse
+
 logger = logging.getLogger("plugin_loader")
 
 PLUGINS_DIR     = os.path.join(os.path.dirname(__file__), "plugins")
 REQ_DIR         = os.path.join(PLUGINS_DIR, "requirements")
 ROOT_REQ_FILE   = os.path.join(os.path.dirname(__file__), "requirements.txt")
 DOCKERFILE_PATH = os.path.join(os.path.dirname(__file__), "Dockerfile")
+
+# ═══════════════════════════════════════════════════
+# حماية بسيطة بتوكن سري مشترك (X-Internal-Token)
+# - يُقرأ من متغير البيئة INTERNAL_TOKEN
+# - إن لم يُضبط، لا حماية (يبقى السلوك القديم — مع تحذير)
+# - "/" و "/health" مستثناة عمداً (فحوصات حالة عامة لا تكشف شيئاً حساساً)
+# ═══════════════════════════════════════════════════
+
+INTERNAL_TOKEN = os.environ.get("INTERNAL_TOKEN", "").strip()
+PUBLIC_PATHS = {"/", "/health"}
+
+
+def _register_auth_middleware(app):
+    if not INTERNAL_TOKEN:
+        logger.warning(
+            "⚠️ INTERNAL_TOKEN غير مضبوط — كل الـ endpoints مفتوحة بدون حماية! "
+            "أضف INTERNAL_TOKEN في إعدادات الـ Space (Settings → Variables and secrets)."
+        )
+        return
+
+    @app.middleware("http")
+    async def _internal_token_guard(request: Request, call_next):
+        if request.url.path in PUBLIC_PATHS:
+            return await call_next(request)
+
+        supplied = request.headers.get("x-internal-token", "")
+        if supplied != INTERNAL_TOKEN:
+            logger.warning(
+                f"🚫 طلب مرفوض (توكن غير صحيح/مفقود) — {request.method} {request.url.path} "
+                f"من {request.client.host if request.client else 'unknown'}"
+            )
+            return JSONResponse(
+                status_code=401,
+                content={"status": "error", "message": "Unauthorized — missing or invalid X-Internal-Token"},
+            )
+
+        return await call_next(request)
+
+    logger.info("🔒 تم تفعيل حماية X-Internal-Token على كل الـ endpoints (عدا / و /health)")
 
 # سجل الـ plugins المحمَّلة — يُعرض في /
 _registry: dict = {}
@@ -170,6 +212,11 @@ def load_all_plugins(app):
     """
     os.makedirs(PLUGINS_DIR, exist_ok=True)
     os.makedirs(REQ_DIR,     exist_ok=True)
+
+    # سجّل حماية التوكن السري قبل أي شيء آخر — لازم middleware يُضاف
+    # قبل أن يبدأ التطبيق بالتعامل مع الطلبات (FastAPI يبني سلسلة الـ
+    # middleware عند الإقلاع)
+    _register_auth_middleware(app)
 
     _sync_root_requirements()
     _sync_dockerfile()
