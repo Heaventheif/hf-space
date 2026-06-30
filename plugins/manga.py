@@ -329,19 +329,64 @@ def _fetch_html_lightweight(url: str) -> str | None:
 #   المستوى 3: Playwright + stealth — متصفح كامل (الأبطأ)
 # ============================================================
 
+_CF_CHALLENGE_MARKERS = [
+    "just a moment",          # عنوان صفحة تحدي Cloudflare الحديثة
+    "checking your browser",
+    "enable javascript and cookies to continue",
+    "cf-turnstile",
+    "challenge-platform",
+    "cf-chl-",
+    "verify you are human",
+]
+
+
+def _looks_like_cf_challenge(page) -> bool:
+    """تتحقق هل الصفحة الحالية لسه شاشة تحدي Cloudflare ولا لأ، بفحص العنوان والمحتوى فعلياً."""
+    try:
+        title = (page.title() or "").lower()
+    except Exception:
+        title = ""
+    if any(marker in title for marker in _CF_CHALLENGE_MARKERS):
+        return True
+    try:
+        html_snippet = page.content()[:5000].lower()
+    except Exception:
+        html_snippet = ""
+    return any(marker in html_snippet for marker in _CF_CHALLENGE_MARKERS)
+
+
 def _wait_for_page_ready(page, timeout=45000):
-    """تنتظر حتى تختفي شاشة Cloudflare ويظهر محتوى الموقع الفعلي."""
+    """تنتظر حتى تختفي شاشة تحدي Cloudflare (Turnstile/JS challenge) ويظهر محتوى الموقع الفعلي.
+
+    ملاحظة: السيليكتور القديم #cf-challenge-widget مش موجود غالباً في تحديات
+    Cloudflare الحديثة (Turnstile)، فلو اعتمدنا عليه بس، wait_for_selector(state="detached")
+    بيرجع فوراً (لأن العنصر أصلاً مش موجود) من غير ما ينتظر التحدي الحقيقي يخلص.
+    بدل كده، بنفحص فعلياً عنوان/محتوى الصفحة ونعيد المحاولة لحد ما التحدي يختفي أو الوقت يخلص.
+    """
+    deadline_ms = timeout
+    poll_interval_ms = 1500
+    elapsed_ms = 0
+
+    # أول استقرار بسيط للصفحة
+    page.wait_for_timeout(random.randint(1500, 2500))
+
+    while elapsed_ms < deadline_ms:
+        if not _looks_like_cf_challenge(page):
+            break
+        page.wait_for_timeout(poll_interval_ms)
+        elapsed_ms += poll_interval_ms
+    else:
+        # خلص الوقت ولسه شكله تحدي: نجرب reload واحد أخير
+        try:
+            page.reload(wait_until="networkidle", timeout=30000)
+            page.wait_for_timeout(3000)
+        except Exception:
+            pass
+
     try:
-        page.wait_for_selector("#cf-challenge-widget", state="detached", timeout=timeout)
+        page.wait_for_selector("body", timeout=15000)
     except Exception:
-        pass
-    page.wait_for_timeout(random.randint(2000, 4000))
-    try:
-        page.wait_for_selector("body", timeout=timeout)
-    except Exception:
-        page.wait_for_timeout(6000)
-        page.reload()
-        page.wait_for_selector("body", timeout=timeout)
+        page.wait_for_timeout(3000)
 
 
 def _new_stealth_context(p):
@@ -402,15 +447,27 @@ def _extract_images_via_playwright(context, chapter_url: str, site_config: dict)
     try:
         page.goto(chapter_url, wait_until="networkidle", timeout=90000)
         _wait_for_page_ready(page)
-        # انتظار ظهور الصور
+
+        still_challenge = _looks_like_cf_challenge(page)
+        try:
+            page_title = page.title()
+        except Exception:
+            page_title = "?"
+        if still_challenge:
+            print(f"[manga][pw][تشخيص] لسه شكله تحدي Cloudflare بعد الانتظار! العنوان: '{page_title}' — {chapter_url}", flush=True)
+
+        # انتظار ظهور الصور (نبني selector صحيح لكل سمة محتملة: img[src], img[data-src], ...)
         attrs = site_config.get("image_attributes", ["src"])
-        selector = f"img[{', img['.join(attrs)}]"
+        selector = ", ".join(f"img[{attr}]" for attr in attrs)
         try:
             page.wait_for_selector(selector, timeout=15000)
         except Exception:
             page.wait_for_timeout(3000)
         html = page.content()
-        return _extract_images_from_html(html, site_config)
+        total_imgs = html.lower().count("<img")
+        result = _extract_images_from_html(html, site_config)
+        print(f"[manga][pw][تشخيص] '{page_title}' — إجمالي <img> بالصفحة: {total_imgs} | بعد الفلترة: {len(result)} — {chapter_url}", flush=True)
+        return result
     finally:
         page.close()
 
@@ -533,9 +590,11 @@ def _scrape_manga_chapter(manga_name: str, chapter_number):
         with sync_playwright() as p:
             browser, context = _new_stealth_context(p)
             try:
+                tried_direct_url = None
                 if not is_latest:
                     chapter_path = site_config["chapter_url_template"].format(slug=effective_slug, chapter=chapter_number)
                     direct_url = base_url + chapter_path
+                    tried_direct_url = direct_url
                     try:
                         images = _extract_images_via_playwright(context, direct_url, site_config)
                         if images:
@@ -574,13 +633,16 @@ def _scrape_manga_chapter(manga_name: str, chapter_number):
                     # محاولة تخمينية
                     fallback_path = site_config["chapter_url_template"].format(slug=effective_slug, chapter=chapter_number)
                     fallback_url = base_url + fallback_path
-                    print(f"[manga][pw] محاولة تخمينية: {fallback_url}", flush=True)
-                    try:
-                        images = _extract_images_via_playwright(context, fallback_url, site_config)
-                        if images:
-                            chapter_url = fallback_url
-                    except Exception:
-                        pass
+                    if fallback_url == tried_direct_url:
+                        print(f"[manga][pw] تخطي المحاولة التخمينية، نفس الرابط جُرّب بالفعل: {fallback_url}", flush=True)
+                    else:
+                        print(f"[manga][pw] محاولة تخمينية: {fallback_url}", flush=True)
+                        try:
+                            images = _extract_images_via_playwright(context, fallback_url, site_config)
+                            if images:
+                                chapter_url = fallback_url
+                        except Exception:
+                            pass
 
                 if not chapter_url:
                     continue
