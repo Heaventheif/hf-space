@@ -6,13 +6,17 @@ endpoint: POST /manga/extract-chapter
   1) curl_cffi  (محاكاة بصمة TLS لمتصفح حقيقي - الأسرع)
   2) cloudscraper (حل تحدي Cloudflare JS البسيط)
   3) Playwright + stealth (متصفح كامل - يُستخدم فقط عند فشل الطرق الأخف)
+
+يدعم الموقعين:
+  - lek-manga.net (بنية Madara)
+  - mangatek.com (بنية حديثة مع /reader/)
 """
 
 import re
 import asyncio
 import logging
 import random
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 from fastapi import Request
 from fastapi.responses import JSONResponse
 from bs4 import BeautifulSoup
@@ -59,101 +63,200 @@ USER_AGENT = (
 
 LATEST_CHAPTER_FLAG = "%%"
 
-SLUG_OVERRIDES = {
-    "one-piece": "pieceone",
-    "one piece": "pieceone",
+# ============================================================
+#  🔧 إعدادات المواقع (SITE_CONFIGS)
+# ============================================================
+SITE_CONFIGS = {
+    "lek-manga.net": {
+        "base_url": "https://lek-manga.net",
+        "chapter_list_selectors": [
+            "li.wp-manga-chapter a",
+            ".version-chap li a",
+            "ul.main.version-chap a",
+            ".chapter-list a"
+        ],
+        "image_container_selectors": [
+            ".wp-manga-section",
+            ".reading-content",
+            ".page-break"
+        ],
+        "image_attributes": ["data-src", "data-lazy-src", "src"],
+        "search_url_template": "https://lek-manga.net/?s={query}&post_type=wp-manga",
+        "search_result_selectors": [
+            "div.c-tabs-item__content .post-title a",
+            ".search-wrap .post-title a",
+            "a[href*='/manga/']"
+        ],
+        "slug_overrides": {
+            "one-piece": "pieceone",
+            "one piece": "pieceone",
+        },
+        "chapter_path_pattern": r"/manga/([^/]+)/(\d+)/?",
+        "chapter_url_pattern": re.compile(r"/(?:chapter-?)?0*(\d+)(?:/|$)"),
+        "manga_main_path": "/manga/{slug}/",
+        "chapter_url_template": "/manga/{slug}/{chapter}/",
+        "image_ignore_patterns": ["emoji", "logo", "avatar", "banner", "icon"],
+        "image_required_patterns": ["uploads", "wp-content"],
+        "image_extensions": [".jpg", ".png", ".webp", ".jpeg"],
+    },
+    "mangatek.com": {
+        "base_url": "https://mangatek.com",
+        "chapter_list_selectors": [
+            "a[href*='/reader/']",  # جميع روابط القراءة
+        ],
+        "image_container_selectors": [
+            "main.flex-grow",   # الأكثر تحديداً (مطابقة واحدة فقط) - نجربه أولاً
+            ".chapter-images",
+            ".flex-grow",       # احتياطي، قد يطابق عناصر متعددة
+            "main",
+        ],
+        # mangatek يحمّل الصور أحياناً عبر data-src (lazy load) قبل ما الـ JS يحطها في src
+        "image_attributes": ["src", "data-src", "data-lazy-src"],
+        "search_url_template": None,  # لا يوجد محرك بحث واضح
+        "search_result_selectors": [],
+        "slug_overrides": {},
+        "chapter_path_pattern": r"/reader/([^/]+)/(\d+)/?",
+        "chapter_url_pattern": re.compile(r"/reader/[^/]+/(\d+)/?$"),
+        "manga_main_path": "/reader/{slug}",
+        "chapter_url_template": "/reader/{slug}/{chapter}",
+        "image_ignore_patterns": ["decorations", "emoji", "logo", "avatar", "banner", "icon"],
+        # روابط صور الفصل الحقيقية شكلها:
+        # https://api.mangatek.com/api/chapters/stream/<id>/<id>?v=1  (بدون امتداد ملف!)
+        "image_required_patterns": ["chapters/stream"],
+        "image_extensions": [],  # متعمد تركها فاضية، الروابط مفيهاش امتداد أصلاً
+    }
 }
 
-BASE_DOMAIN = "https://lek-manga.net"
+# ترتيب المحاولة: الأكثر استخداماً أولاً
+SITE_ORDER = ["mangatek.com", "lek-manga.net"]
 
 
-def _normalize_slug(manga_name: str) -> str:
+def _get_site_config(url_or_domain: str) -> dict | None:
+    """ترجع إعدادات الموقع بناءً على الرابط أو النطاق."""
+    domain = urlparse(url_or_domain).netloc if "://" in url_or_domain else url_or_domain
+    for site_domain, config in SITE_CONFIGS.items():
+        if site_domain in domain:
+            return config
+    return None
+
+
+def _normalize_slug(manga_name: str, site_config: dict) -> str:
+    """تطبيق استثناءات الـ Slug حسب الموقع."""
     key = manga_name.lower().strip()
-    return SLUG_OVERRIDES.get(key, key)
+    overrides = site_config.get("slug_overrides", {})
+    return overrides.get(key, key)
 
 
-def _is_chapter_link(href: str, chapter_number) -> bool:
+def _is_chapter_link(href: str, chapter_number, site_config: dict) -> bool:
+    """تتحقق من أن الرابط يشير إلى الفصل المطلوب حسب نمط الموقع."""
     href_clean = href.split('?')[0]
-    pattern = re.compile(
-        rf"/(?:chapter-?)?0*{re.escape(str(chapter_number))}(?:/|$)",
-        re.IGNORECASE
-    )
-    return bool(pattern.search(href_clean))
+    pattern = site_config.get("chapter_url_pattern")
+    if pattern:
+        match = pattern.search(href_clean)
+        if match:
+            # نأخذ آخر مجموعة أرقام
+            nums = re.findall(r'\d+', href_clean)
+            if nums and int(nums[-1]) == int(chapter_number):
+                return True
+    # fallback
+    return bool(re.search(rf"/(?:chapter-?)?0*{re.escape(str(chapter_number))}(?:/|$)", href_clean, re.IGNORECASE))
 
 
-def _find_chapter_link(html_content: str, chapter_number) -> str | None:
+def _find_chapter_link(html_content: str, chapter_number, site_config: dict) -> str | None:
+    """يبحث عن رابط الفصل حسب إعدادات الموقع."""
     soup = BeautifulSoup(html_content, "lxml")
-    selectors = [
-        "li.wp-manga-chapter a",
-        ".version-chap li a",
-        "ul.main.version-chap a",
-        ".chapter-list a"
-    ]
+    selectors = site_config.get("chapter_list_selectors", [])
     for selector in selectors:
         links = soup.select(selector)
-        if links:
-            for a in links:
-                href = a.get("href", "").strip()
-                if href and _is_chapter_link(href, chapter_number):
-                    return href
+        for a in links:
+            href = a.get("href", "").strip()
+            if href and _is_chapter_link(href, chapter_number, site_config):
+                return href
+    # fallback: البحث في كل الروابط التي تحتوي على /manga/ أو /reader/
     all_links = soup.find_all("a", href=True)
     for a in all_links:
         href = a["href"].strip()
-        if "/manga/" in href and _is_chapter_link(href, chapter_number):
+        if ("/manga/" in href or "/reader/" in href) and _is_chapter_link(href, chapter_number, site_config):
             return href
     return None
 
 
-def _find_latest_chapter_link(html_content: str, manga_main_url: str) -> str | None:
+def _find_latest_chapter_link(html_content: str, manga_main_url: str, site_config: dict) -> str | None:
+    """يبحث عن أحدث فصل (الأول في القائمة)."""
     soup = BeautifulSoup(html_content, "lxml")
     base = manga_main_url.rstrip("/")
-    selectors = [
-        "li.wp-manga-chapter a",
-        ".version-chap li a",
-        "ul.main.version-chap a",
-        ".chapter-list a"
-    ]
+    selectors = site_config.get("chapter_list_selectors", [])
     for selector in selectors:
         links = soup.select(selector)
-        if links:
-            for a in links:
-                href = a.get("href", "").strip().rstrip("/")
-                if not href or "/manga/" not in href:
-                    continue
-                if href == base:
-                    continue
+        for a in links:
+            href = a.get("href", "").strip().rstrip("/")
+            if not href:
+                continue
+            if ("/manga/" in href or "/reader/" in href) and href != base:
                 return href + "/"
+    # fallback
     all_links = soup.find_all("a", href=True)
     for a in all_links:
         href = a["href"].strip().rstrip("/")
-        if not href or "/manga/" not in href:
+        if not href:
             continue
-        if href == base:
-            continue
-        return href + "/"
+        if ("/manga/" in href or "/reader/" in href) and href != base:
+            return href + "/"
     return None
 
 
-def _extract_images_from_html(html_content: str) -> list:
-    """يستخرج روابط صور الفصل من نص HTML خام (دون متصفح)."""
+def _extract_images_from_html(html_content: str, site_config: dict) -> list:
+    """يستخرج روابط صور الفصل من نص HTML حسب إعدادات الموقع."""
     soup = BeautifulSoup(html_content, "lxml")
-    container = (
-        soup.find(class_="wp-manga-section") or
-        soup.find(class_="reading-content") or
-        soup.find(class_="page-break")
-    )
-    images = container.find_all("img") if container else soup.find_all("img")
+    container_selectors = site_config.get("image_container_selectors", [])
+    container = None
+    for selector in container_selectors:
+        container = soup.select_one(selector)
+        if container:
+            break
+    if not container:
+        container = soup
+
+    images = container.find_all("img")
     valid = []
+    attrs = site_config.get("image_attributes", ["src"])
+    ignore_patterns = site_config.get("image_ignore_patterns", [])
+    required_patterns = site_config.get("image_required_patterns", [])
+    extensions = site_config.get("image_extensions", [])
+
     for img in images:
-        url = img.get("data-src") or img.get("data-lazy-src") or img.get("src")
+        url = None
+        for attr in attrs:
+            url = img.get(attr)
+            if url:
+                break
         if not url:
             continue
         url = url.strip()
-        if any(bad in url.lower() for bad in ["emoji", "logo", "avatar", "banner", "icon"]):
+
+        # تجاهل الصور غير المرغوب فيها
+        if any(bad in url.lower() for bad in ignore_patterns):
             continue
-        if "uploads" in url or "wp-content" in url:
-            if any(ext in url.lower() for ext in [".jpg", ".png", ".webp", ".jpeg"]):
+
+        # إذا كان هناك أنماط مطلوبة، تحقق منها، ومطابقتها كافية وحدها للقبول
+        # (مفيد لمواقع زي mangatek اللي روابط صورها API بدون امتداد ملف، مثل:
+        #  https://api.mangatek.com/api/chapters/stream/<id>/<id>?v=1)
+        if required_patterns:
+            if any(req in url.lower() for req in required_patterns):
                 valid.append(url)
+                continue
+            else:
+                continue
+
+        # التحقق من امتدادات الصور (إذا كانت موجودة)
+        if extensions:
+            if any(ext in url.lower() for ext in extensions):
+                valid.append(url)
+        else:
+            # إذا لم تكن هناك امتدادات محددة، نقبل أي رابط يحتوي على image أو uploads
+            if "image" in url.lower() or "uploads" in url.lower():
+                valid.append(url)
+
     return list(dict.fromkeys(valid))
 
 
@@ -189,7 +292,6 @@ def _fetch_with_curl_cffi(url: str) -> str | None:
 
 _cloudscraper_session = None
 
-
 def _get_cloudscraper_session():
     global _cloudscraper_session
     if _cloudscraper_session is None and HAS_CLOUDSCRAPER:
@@ -197,7 +299,6 @@ def _get_cloudscraper_session():
             browser={"browser": "chrome", "platform": "windows", "mobile": False}
         )
     return _cloudscraper_session
-
 
 def _fetch_with_cloudscraper(url: str) -> str | None:
     if not HAS_CLOUDSCRAPER:
@@ -234,16 +335,13 @@ def _wait_for_page_ready(page, timeout=45000):
         page.wait_for_selector("#cf-challenge-widget", state="detached", timeout=timeout)
     except Exception:
         pass
-
-    # وقت إضافي لإتمام تنفيذ تحدي JS قبل الفحص عن المحتوى الفعلي
     page.wait_for_timeout(random.randint(2000, 4000))
-
     try:
-        page.wait_for_selector(".site-header, .main-navigation, .profile-manga", timeout=timeout)
+        page.wait_for_selector("body", timeout=timeout)
     except Exception:
         page.wait_for_timeout(6000)
         page.reload()
-        page.wait_for_selector(".site-header, .main-navigation, .profile-manga", timeout=timeout)
+        page.wait_for_selector("body", timeout=timeout)
 
 
 def _new_stealth_context(p):
@@ -258,7 +356,6 @@ def _new_stealth_context(p):
     try:
         browser = p.chromium.launch(headless=True, channel="chrome", args=browser_args)
     except Exception:
-        # في حال عدم توفر قناة chrome الحقيقية على السيرفر، نعود لـ chromium الافتراضي
         browser = p.chromium.launch(headless=True, args=browser_args)
 
     context = browser.new_context(
@@ -300,178 +397,225 @@ def _fetch_html_with_playwright(context, url: str) -> str:
         page.close()
 
 
-def _extract_images_via_playwright(context, chapter_url: str) -> list:
+def _extract_images_via_playwright(context, chapter_url: str, site_config: dict) -> list:
     page = _new_stealth_page(context)
     try:
         page.goto(chapter_url, wait_until="networkidle", timeout=90000)
         _wait_for_page_ready(page)
+        # انتظار ظهور الصور
+        attrs = site_config.get("image_attributes", ["src"])
+        selector = f"img[{', img['.join(attrs)}]"
         try:
-            page.wait_for_selector("img[data-src], img[data-lazy-src], img[src]", timeout=15000)
+            page.wait_for_selector(selector, timeout=15000)
         except Exception:
             page.wait_for_timeout(3000)
         html = page.content()
-        return _extract_images_from_html(html)
+        return _extract_images_from_html(html, site_config)
     finally:
         page.close()
 
 
-def _search_manga_main_url_lightweight(query: str) -> str | None:
-    search_url = f"{BASE_DOMAIN}/?s={quote(query)}&post_type=wp-manga"
+# ============================================================
+#   دوال البحث الخاصة بكل موقع (خفيفة وثقيلة)
+# ============================================================
+
+def _search_manga_main_url_lightweight(query: str, site_config: dict) -> str | None:
+    search_template = site_config.get("search_url_template")
+    if not search_template:
+        return None
+    search_url = search_template.format(query=quote(query))
     html = _fetch_html_lightweight(search_url)
     if not html:
         return None
     soup = BeautifulSoup(html, "lxml")
-    candidates = (
-        soup.select("div.c-tabs-item__content .post-title a") or
-        soup.select(".search-wrap .post-title a") or
-        soup.select("a[href*='/manga/']")
-    )
-    for a in candidates:
-        href = (a.get("href") or "").strip()
-        if "/manga/" in href and href != search_url:
-            return href.rstrip("/") + "/"
+    selectors = site_config.get("search_result_selectors", [])
+    for selector in selectors:
+        links = soup.select(selector)
+        for a in links:
+            href = (a.get("href") or "").strip()
+            if ("/manga/" in href or "/reader/" in href) and href != search_url:
+                return href.rstrip("/") + "/"
     return None
 
 
-def _search_manga_main_url_playwright(context, query: str) -> str | None:
-    search_url = f"{BASE_DOMAIN}/?s={quote(query)}&post_type=wp-manga"
+def _search_manga_main_url_playwright(context, query: str, site_config: dict) -> str | None:
+    search_template = site_config.get("search_url_template")
+    if not search_template:
+        return None
+    search_url = search_template.format(query=quote(query))
     html = _fetch_html_with_playwright(context, search_url)
     soup = BeautifulSoup(html, "lxml")
-    candidates = (
-        soup.select("div.c-tabs-item__content .post-title a") or
-        soup.select(".search-wrap .post-title a") or
-        soup.select("a[href*='/manga/']")
-    )
-    for a in candidates:
-        href = (a.get("href") or "").strip()
-        if "/manga/" in href and href != search_url:
-            return href.rstrip("/") + "/"
+    selectors = site_config.get("search_result_selectors", [])
+    for selector in selectors:
+        links = soup.select(selector)
+        for a in links:
+            href = (a.get("href") or "").strip()
+            if ("/manga/" in href or "/reader/" in href) and href != search_url:
+                return href.rstrip("/") + "/"
     return None
 
 
 # ============================================================
-#   المنطق الرئيسي: يبدأ خفيف، ويتصاعد فقط عند الحاجة
+#   المنطق الرئيسي: يحاول كل موقع بالتسلسل
 # ============================================================
 
 def _scrape_manga_chapter(manga_name: str, chapter_number):
     is_latest = str(chapter_number).strip() == LATEST_CHAPTER_FLAG
-    effective_slug = _normalize_slug(manga_name)
-    print(f"[manga] بدء: '{manga_name}' → slug '{effective_slug}'", flush=True)
+    print(f"[manga] بدء: '{manga_name}', الفصل: '{chapter_number}'", flush=True)
 
-    # ---------- المرحلة A: محاولة خفيفة بالكامل (curl_cffi / cloudscraper) ----------
-    if not is_latest:
-        direct_url = f"{BASE_DOMAIN}/manga/{effective_slug}/{chapter_number}/"
-        print(f"[manga][light] محاولة مباشرة: {direct_url}", flush=True)
-        html = _fetch_html_lightweight(direct_url)
-        if html:
-            images = _extract_images_from_html(html)
-            if images:
-                return {
-                    "ok": True, "error": None, "images": images,
-                    "chapter_url": direct_url, "detected_chapter": str(chapter_number),
-                }
+    # نمر على كل موقع في الترتيب المحدد
+    for domain in SITE_ORDER:
+        site_config = SITE_CONFIGS.get(domain)
+        if not site_config:
+            continue
 
-    if effective_slug != manga_name.lower():
-        main_url = f"{BASE_DOMAIN}/manga/{effective_slug}/"
-    else:
-        search_query = manga_name.replace("-", " ").replace("_", " ").strip()
-        resolved = _search_manga_main_url_lightweight(search_query)
-        main_url = resolved if resolved else f"{BASE_DOMAIN}/manga/{effective_slug}/"
+        effective_slug = _normalize_slug(manga_name, site_config)
+        base_url = site_config["base_url"]
 
-    main_html = _fetch_html_lightweight(main_url)
-    if main_html:
-        chapter_url = (
-            _find_latest_chapter_link(main_html, main_url) if is_latest
-            else _find_chapter_link(main_html, chapter_number)
-        )
-        if chapter_url:
-            html = _fetch_html_lightweight(chapter_url)
+        # ---------- المرحلة A: محاولة خفيفة (curl_cffi / cloudscraper) ----------
+        print(f"[manga][light] محاولة {domain}...", flush=True)
+
+        if not is_latest:
+            chapter_path = site_config["chapter_url_template"].format(slug=effective_slug, chapter=chapter_number)
+            direct_url = base_url + chapter_path
+            print(f"[manga][light] مباشرة: {direct_url}", flush=True)
+            html = _fetch_html_lightweight(direct_url)
             if html:
-                images = _extract_images_from_html(html)
+                images = _extract_images_from_html(html, site_config)
                 if images:
-                    detected = chapter_url.rstrip("/").split("/")[-1]
-                    print(f"[manga][light] ✅ نجح بدون متصفح: {chapter_url}", flush=True)
+                    return {
+                        "ok": True, "error": None, "images": images,
+                        "chapter_url": direct_url, "detected_chapter": str(chapter_number),
+                        "site": domain
+                    }
+
+        # الحصول على الرابط الرئيسي للمانجا
+        if effective_slug != manga_name.lower() and site_config.get("slug_overrides"):
+            main_path = site_config["manga_main_path"].format(slug=effective_slug)
+            main_url = base_url + main_path
+        else:
+            search_query = manga_name.replace("-", " ").replace("_", " ").strip()
+            resolved = _search_manga_main_url_lightweight(search_query, site_config)
+            if resolved:
+                main_url = resolved
+            else:
+                main_path = site_config["manga_main_path"].format(slug=effective_slug)
+                main_url = base_url + main_path
+
+        print(f"[manga][light] رئيسية: {main_url}", flush=True)
+        main_html = _fetch_html_lightweight(main_url)
+        if main_html:
+            chapter_url = (
+                _find_latest_chapter_link(main_html, main_url, site_config) if is_latest
+                else _find_chapter_link(main_html, chapter_number, site_config)
+            )
+            if chapter_url:
+                # تأكد من أن الرابط مطلق
+                if chapter_url.startswith("/"):
+                    chapter_url = base_url + chapter_url
+                elif not chapter_url.startswith("http"):
+                    chapter_url = base_url + "/" + chapter_url.lstrip("/")
+
+                html = _fetch_html_lightweight(chapter_url)
+                if html:
+                    images = _extract_images_from_html(html, site_config)
+                    if images:
+                        detected = chapter_url.rstrip("/").split("/")[-1]
+                        print(f"[manga][light] ✅ نجح بدون متصفح على {domain}: {chapter_url}", flush=True)
+                        return {
+                            "ok": True, "error": None, "images": images,
+                            "chapter_url": chapter_url, "detected_chapter": detected,
+                            "site": domain
+                        }
+
+        # ---------- المرحلة B: المتصفح الكامل (Playwright + stealth) ----------
+        print(f"[manga][pw] الطرق الخفيفة فشلت لـ {domain}، الانتقال لـ Playwright", flush=True)
+        with sync_playwright() as p:
+            browser, context = _new_stealth_context(p)
+            try:
+                if not is_latest:
+                    chapter_path = site_config["chapter_url_template"].format(slug=effective_slug, chapter=chapter_number)
+                    direct_url = base_url + chapter_path
+                    try:
+                        images = _extract_images_via_playwright(context, direct_url, site_config)
+                        if images:
+                            return {
+                                "ok": True, "error": None, "images": images,
+                                "chapter_url": direct_url, "detected_chapter": str(chapter_number),
+                                "site": domain
+                            }
+                    except Exception as e:
+                        print(f"[manga][pw] فشل المباشرة لـ {domain}: {e}", flush=True)
+
+                if effective_slug != manga_name.lower() and site_config.get("slug_overrides"):
+                    main_path = site_config["manga_main_path"].format(slug=effective_slug)
+                    main_url = base_url + main_path
+                else:
+                    search_query = manga_name.replace("-", " ").replace("_", " ").strip()
+                    try:
+                        resolved = _search_manga_main_url_playwright(context, search_query, site_config)
+                        main_url = resolved if resolved else base_url + site_config["manga_main_path"].format(slug=effective_slug)
+                    except Exception as e:
+                        print(f"[manga][pw] فشل البحث لـ {domain}: {e}", flush=True)
+                        main_url = base_url + site_config["manga_main_path"].format(slug=effective_slug)
+
+                try:
+                    html = _fetch_html_with_playwright(context, main_url)
+                except Exception as e:
+                    print(f"[manga][pw] فشل فتح الرئيسية لـ {domain}: {e}", flush=True)
+                    continue
+
+                chapter_url = (
+                    _find_latest_chapter_link(html, main_url, site_config) if is_latest
+                    else _find_chapter_link(html, chapter_number, site_config)
+                )
+
+                if not chapter_url:
+                    # محاولة تخمينية
+                    fallback_path = site_config["chapter_url_template"].format(slug=effective_slug, chapter=chapter_number)
+                    fallback_url = base_url + fallback_path
+                    print(f"[manga][pw] محاولة تخمينية: {fallback_url}", flush=True)
+                    try:
+                        images = _extract_images_via_playwright(context, fallback_url, site_config)
+                        if images:
+                            chapter_url = fallback_url
+                    except Exception:
+                        pass
+
+                if not chapter_url:
+                    continue
+
+                if chapter_url.startswith("/"):
+                    chapter_url = base_url + chapter_url
+                elif not chapter_url.startswith("http"):
+                    chapter_url = base_url + "/" + chapter_url.lstrip("/")
+
+                detected = chapter_url.rstrip("/").split("/")[-1]
+                print(f"[manga][pw] ✅ الفصل على {domain}: {chapter_url} (مكتشف: {detected})", flush=True)
+
+                try:
+                    images = _extract_images_via_playwright(context, chapter_url, site_config)
+                except Exception as e:
+                    print(f"[manga][pw] فشل استخراج الصور: {e}", flush=True)
+                    images = []
+
+                if images:
                     return {
                         "ok": True, "error": None, "images": images,
                         "chapter_url": chapter_url, "detected_chapter": detected,
+                        "site": domain
                     }
 
-    # ---------- المرحلة B: المتصفح الكامل (Playwright + stealth) ----------
-    print("[manga] الطرق الخفيفة فشلت، الانتقال لـ Playwright + stealth", flush=True)
-    with sync_playwright() as p:
-        browser, context = _new_stealth_context(p)
-        try:
-            if not is_latest:
-                direct_url = f"{BASE_DOMAIN}/manga/{effective_slug}/{chapter_number}/"
-                try:
-                    images = _extract_images_via_playwright(context, direct_url)
-                    if images:
-                        return {
-                            "ok": True, "error": None, "images": images,
-                            "chapter_url": direct_url, "detected_chapter": str(chapter_number),
-                        }
-                except Exception as e:
-                    print(f"[manga][pw] فشل المباشرة: {e}", flush=True)
+            finally:
+                browser.close()
 
-            if effective_slug != manga_name.lower():
-                main_url = f"{BASE_DOMAIN}/manga/{effective_slug}/"
-            else:
-                search_query = manga_name.replace("-", " ").replace("_", " ").strip()
-                try:
-                    resolved = _search_manga_main_url_playwright(context, search_query)
-                    main_url = resolved if resolved else f"{BASE_DOMAIN}/manga/{effective_slug}/"
-                except Exception as e:
-                    print(f"[manga][pw] فشل البحث: {e}", flush=True)
-                    main_url = f"{BASE_DOMAIN}/manga/{effective_slug}/"
-
-            try:
-                html = _fetch_html_with_playwright(context, main_url)
-            except Exception as e:
-                return {"ok": False, "error": f"تعذر الوصول: {e}", "images": [], "chapter_url": None, "detected_chapter": None}
-
-            chapter_url = (
-                _find_latest_chapter_link(html, main_url) if is_latest
-                else _find_chapter_link(html, chapter_number)
-            )
-
-            if not chapter_url:
-                fallback = f"{BASE_DOMAIN}/manga/{effective_slug}/{chapter_number}/"
-                print(f"[manga][pw] محاولة تخمينية: {fallback}", flush=True)
-                try:
-                    images = _extract_images_via_playwright(context, fallback)
-                    if images:
-                        chapter_url = fallback
-                except Exception:
-                    pass
-
-            if not chapter_url:
-                return {
-                    "ok": False,
-                    "error": f"لم يُعثر على الفصل {'الأخير' if is_latest else chapter_number}",
-                    "images": [], "chapter_url": None, "detected_chapter": None,
-                }
-
-            detected = chapter_url.rstrip("/").split("/")[-1]
-            print(f"[manga][pw] ✅ الفصل: {chapter_url} (مكتشف: {detected})", flush=True)
-
-            try:
-                images = _extract_images_via_playwright(context, chapter_url)
-            except Exception as e:
-                print(f"[manga][pw] فشل استخراج الصور: {e}", flush=True)
-                images = []
-
-            if not images:
-                return {
-                    "ok": False, "error": "فشل استخراج الصور",
-                    "images": [], "chapter_url": chapter_url, "detected_chapter": detected,
-                }
-
-            return {
-                "ok": True, "error": None, "images": images,
-                "chapter_url": chapter_url, "detected_chapter": detected,
-            }
-        finally:
-            browser.close()
+    # إذا وصلنا إلى هنا، فشلت جميع المواقع
+    return {
+        "ok": False,
+        "error": f"لم يتم العثور على الفصل {'الأخير' if is_latest else chapter_number} في أي موقع.",
+        "images": [], "chapter_url": None, "detected_chapter": None,
+        "site": None
+    }
 
 
 def register(app):
@@ -493,7 +637,7 @@ def register(app):
             result = await loop.run_in_executor(None, _scrape_manga_chapter, manga_name, chapter_number)
 
             if not result["ok"]:
-                status = 404 if "لم يُعثر" in (result["error"] or "") else 500
+                status = 404 if "لم يتم العثور" in (result["error"] or "") else 500
                 return JSONResponse(status_code=status, content={"status": "error", "message": result["error"]})
 
             return JSONResponse({
@@ -502,6 +646,7 @@ def register(app):
                 "chapter_number": result.get("detected_chapter") or chapter_number,
                 "total_pages": len(result["images"]),
                 "images": result["images"],
+                "site": result.get("site", "unknown")
             })
 
         except Exception as e:
