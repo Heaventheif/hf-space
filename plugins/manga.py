@@ -8,11 +8,14 @@ endpoint: POST /manga/extract-chapter
 
 import re
 import asyncio
+import logging
 from urllib.parse import quote
 from fastapi import Request
 from fastapi.responses import JSONResponse
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
+
+logger = logging.getLogger("manga_scraper")
 
 # تعريف إلزامي يقرأه الـ loader ويعرضه في قائمة الـ plugins عند طلب GET /
 DESCRIPTION = "كشط واستخراج روابط صور فصول المانجا والمانهوا المترجمة للعربية، بحث برقم فصل أو عن آخر فصل (%%)"
@@ -121,6 +124,8 @@ def _scrape_manga_chapter(manga_name: str, chapter_number):
 
     # بناء رابط المانجا الرئيسي المباشر (تخمين أولي بافتراض أن manga_name = slug صحيح)
     direct_main_url = f"https://lek-manga.net/manga/{manga_name}/"
+    logger.info(f"[manga] محاولة مباشرة: {direct_main_url}")
+    print(f"[manga_scraper] 🔗 محاولة مباشرة: {direct_main_url}", flush=True)
 
     def _locate_chapter(html_content: str, main_url: str):
         if is_latest:
@@ -147,9 +152,12 @@ def _scrape_manga_chapter(manga_name: str, chapter_number):
             #    عبر محرك بحث الموقع لإيجاد رابط المانجا الصحيح
             if not target_chapter_url:
                 search_query = manga_name.replace("-", " ").replace("_", " ")
+                print(f"[manga_scraper] 🔍 المحاولة المباشرة فشلت، البحث عن: '{search_query}'", flush=True)
                 try:
                     resolved_main_url = _search_manga_main_url(page, search_query)
-                except Exception:
+                    print(f"[manga_scraper] 🔗 رابط محلول من البحث: {resolved_main_url}", flush=True)
+                except Exception as e:
+                    print(f"[manga_scraper] ❌ فشل البحث التلقائي: {e}", flush=True)
                     resolved_main_url = None
 
                 if resolved_main_url and resolved_main_url != direct_main_url:
@@ -182,6 +190,7 @@ def _scrape_manga_chapter(manga_name: str, chapter_number):
 
             # استخراج رقم/تسمية الفصل المكتشف فعلياً من الرابط (مفيد خاصة في وضع %%)
             detected_chapter = target_chapter_url.rstrip("/").split("/")[-1]
+            print(f"[manga_scraper] ✅ رابط الفصل المكتشف: {target_chapter_url} (detected={detected_chapter})", flush=True)
 
             # 3. كشط الصور من رابط الفصل الذي عثرنا عليه (نفس المتصفح، صفحة جديدة)
             chapter_page = context.new_page()
@@ -252,6 +261,11 @@ def register(app):
             manga_name = body.get("manga_name")
             chapter_number = body.get("chapter_number")
 
+            # طباعة الطلب الخام القادم من Render فور استقباله (قبل أي تحقق/معالجة)
+            # لتشخيص أي مشكلة في أسماء الحقول أو القيم المُرسلة من البوت
+            print(f"[manga_scraper] 📥 طلب وارد: body={body}", flush=True)
+            logger.info(f"[manga] طلب وارد: manga_name={manga_name!r}, chapter_number={chapter_number!r}")
+
             if not manga_name or chapter_number is None:
                 return JSONResponse(
                     status_code=400,
@@ -283,6 +297,7 @@ def register(app):
             )
 
         except Exception as e:
+            print(f"[manga_scraper] ❌ خطأ غير متوقع: {e}", flush=True)
             return JSONResponse(
                 status_code=500,
                 content={"status": "error", "message": f"حدث خطأ غير متوقع أثناء معالجة الطلب: {str(e)}"},
